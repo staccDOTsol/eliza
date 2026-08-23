@@ -125,10 +125,8 @@ describe("SqliteSyntheticCommandJournal", () => {
       "durable-command-journal",
       "production-runtime-boot",
       "production-pglite-readback",
-    ]);
-    expect(SYNTHETIC_WORLD_CAPABILITIES.unavailable).toContain(
       "cloud-command-journal-adapter",
-    );
+    ]);
     expect(SYNTHETIC_WORLD_CAPABILITIES.unavailable).toContain(
       "observation-ledger",
     );
@@ -205,6 +203,61 @@ describe("SqliteSyntheticCommandJournal", () => {
         mutate,
       ),
     ).rejects.toMatchObject({ code: "SYNTHETIC_COMMAND_ID_CONFLICT" });
+    store.close();
+  });
+
+  test("awaits an asynchronous mutation inside the guarded transaction", async () => {
+    const databasePath = tempDatabase();
+    const store = new SqliteSyntheticEnvironmentLeaseStore(databasePath);
+    const authority = await acquire(store, "async-mutation", "owner", 5_000);
+    const journal = new SqliteSyntheticCommandJournal(store);
+    const execution = await journal.execute(
+      authority,
+      command(authority, "async-command"),
+      async (database) => {
+        await Promise.resolve();
+        database.run("CREATE TABLE async_domain_write (value TEXT NOT NULL)");
+        database.run("INSERT INTO async_domain_write (value) VALUES (?)", [
+          "committed",
+        ]);
+        return { async: true };
+      },
+    );
+    expect(execution.result).toEqual({ async: true });
+    expect(
+      store.database
+        .query<{ value: string }, []>("SELECT value FROM async_domain_write")
+        .get(),
+    ).toEqual({ value: "committed" });
+    store.close();
+  });
+
+  test("rolls back an asynchronous mutation that rejects", async () => {
+    const databasePath = tempDatabase();
+    const store = new SqliteSyntheticEnvironmentLeaseStore(databasePath);
+    const authority = await acquire(store, "async-rollback", "owner", 5_000);
+    const journal = new SqliteSyntheticCommandJournal(store);
+    await expect(
+      journal.execute(
+        authority,
+        command(authority, "async-rejection"),
+        async (database) => {
+          database.run("CREATE TABLE rejected_domain_write (value TEXT)");
+          await Promise.resolve();
+          throw new Error("async mutation rejected");
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: "SYNTHETIC_COMMAND_EXECUTION_FAILED",
+    });
+    expect(() =>
+      store.database.query("SELECT * FROM rejected_domain_write").all(),
+    ).toThrow();
+    expect(await journal.inspect(authority, "async-rejection")).toMatchObject({
+      phase: "FAILED",
+      outcome: "KNOWN_FAILURE",
+      error: { message: "async mutation rejected" },
+    });
     store.close();
   });
 

@@ -128,6 +128,7 @@ export * from "./seo-provider-calls";
 export * from "./seo-requests";
 export * from "./service-pricing";
 export * from "./synthetic-environment-leases";
+export * from "./synthetic-world-commands";
 // ============================================
 // Token Redemptions (elizaOS payouts)
 // ============================================

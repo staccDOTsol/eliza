@@ -1,7 +1,8 @@
 # This workflow is the sole pull-request and merge-candidate validation authority.
 # It checks mergeability, changed secrets and workflow syntax, then builds and
-# statically validates the affected workspace closure without running test,
-# provider, device, deployment, or destructive-effect lanes.
+# statically validates the affected workspace closure. The bounded
+# synthetic-world transaction suite is the one affected-path test exception;
+# provider, device, deployment, and destructive-effect lanes remain excluded.
 name: PR Static Smoke
 
 on:
@@ -65,6 +66,11 @@ jobs:
 
           echo "merge_base=$merge_base" >> "$GITHUB_OUTPUT"
           echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          if git diff --quiet "$merge_base"..."$HEAD_SHA" -- packages/synthetic-world; then
+            echo "synthetic_world_changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "synthetic_world_changed=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Install pinned gitleaks
         shell: bash
@@ -133,6 +139,10 @@ jobs:
 
       - name: Build core contract
         run: bun run build:core
+
+      - name: Run synthetic-world transaction tests
+        if: steps.diff.outputs.synthetic_world_changed == 'true'
+        run: bun run --cwd packages/synthetic-world test
 
       - name: Lint affected workspace closure
         env:
