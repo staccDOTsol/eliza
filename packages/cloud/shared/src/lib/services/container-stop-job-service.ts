@@ -94,8 +94,10 @@ export async function dispatchContainerStopJob(job: {
   organization_id?: string;
   data: unknown;
 }): Promise<ContainerStopOutcome> {
-  const { containerId, organizationId, intentId, lifecycleRevision, authorization } =
+  const { containerId, organizationId, intentId, lifecycleRevision } =
     readContainerStopJobData(job);
+  if (!job.id) throw new Error("CONTAINER_STOP claimed job id is required");
+  const jobId = job.id;
   if (job.organization_id !== undefined && job.organization_id !== organizationId) {
     throw new Error("CONTAINER_STOP job tenant envelope mismatch");
   }
@@ -147,31 +149,9 @@ export async function dispatchContainerStopJob(job: {
       .limit(1);
     if (!organization) throw new Error("CONTAINER_STOP billing organization not found");
 
-    let earningsAvailable = new Decimal(0);
-    if (authorization === "billing_request" && organization.pay_as_you_go_from_earnings) {
-      const [sourceUser] = await tx
-        .select({ id: users.id })
-        .from(users)
-        .where(eq(users.organization_id, organizationId))
-        .orderBy(desc(sql`${users.role} = 'owner'`), asc(users.created_at), asc(users.id))
-        .limit(1);
-      if (sourceUser) {
-        await tx.execute(
-          sql`SELECT pg_advisory_xact_lock(hashtext(${`redeemable_earnings:${sourceUser.id}`}))`,
-        );
-        const [earnings] = await tx
-          .select({ available_balance: redeemableEarnings.available_balance })
-          .from(redeemableEarnings)
-          .where(eq(redeemableEarnings.user_id, sourceUser.id))
-          .for("update")
-          .limit(1);
-        if (earnings) earningsAvailable = new Decimal(earnings.available_balance);
-      }
-    }
-
-    // Intent is always the final lock in the billing order. A lifecycle writer
-    // that owns workload+organization can supersede it without deadlocking a
-    // simultaneous stop claim.
+    // Intent and then its bound job are the final authority locks in the
+    // billing order. Enqueue upgrades take the same order, so a lifecycle
+    // writer can supersede a simultaneous stop claim without deadlock.
     const [intent] = await tx
       .select()
       .from(containerComputeStopIntents)
@@ -187,9 +167,37 @@ export async function dispatchContainerStopJob(job: {
     if (!intent || intent.lifecycle_revision !== lifecycleRevision) {
       throw new Error("CONTAINER_STOP durable intent changed during claim");
     }
-    if (intent.job_id && job.id && intent.job_id !== job.id) {
+    if (intent.job_id && intent.job_id !== jobId) {
       throw new Error("CONTAINER_STOP job is not the current durable intent owner");
     }
+
+    // The queue claim may have hydrated this payload before a concurrent
+    // explicit user stop upgraded billing authority. Reread it while holding
+    // the workload, organization, and intent locks; only this fenced value may
+    // decide whether restored funding can supersede provider shutdown.
+    const [currentJob] = await tx
+      .select({ data: jobs.data })
+      .from(jobs)
+      .where(
+        and(
+          eq(jobs.id, jobId),
+          eq(jobs.organization_id, organizationId),
+          eq(jobs.type, JOB_TYPES.CONTAINER_STOP),
+        ),
+      )
+      .for("update")
+      .limit(1);
+    if (!currentJob) throw new Error("CONTAINER_STOP durable job authority is missing");
+    const current = readContainerStopJobData(currentJob);
+    if (
+      current.containerId !== containerId ||
+      current.organizationId !== organizationId ||
+      current.intentId !== intentId ||
+      current.lifecycleRevision !== lifecycleRevision
+    ) {
+      throw new Error("CONTAINER_STOP durable job authority changed identity");
+    }
+    const authorization = current.authorization;
     if (intent.status === "provider_confirmed") {
       return {
         outcome: { stopped: true, reason: "already-provider-confirmed" },
@@ -211,6 +219,28 @@ export async function dispatchContainerStopJob(job: {
         .set({ status: "superseded", superseded_at: supersededAt, updated_at: supersededAt })
         .where(eq(containerComputeStopIntents.id, intentId));
       return { outcome: { stopped: false, reason: "stale-lifecycle-generation" } };
+    }
+
+    let earningsAvailable = new Decimal(0);
+    if (authorization === "billing_request" && organization.pay_as_you_go_from_earnings) {
+      const [sourceUser] = await tx
+        .select({ id: users.id })
+        .from(users)
+        .where(eq(users.organization_id, organizationId))
+        .orderBy(desc(sql`${users.role} = 'owner'`), asc(users.created_at), asc(users.id))
+        .limit(1);
+      if (sourceUser) {
+        await tx.execute(
+          sql`SELECT pg_advisory_xact_lock(hashtext(${`redeemable_earnings:${sourceUser.id}`}))`,
+        );
+        const [earnings] = await tx
+          .select({ available_balance: redeemableEarnings.available_balance })
+          .from(redeemableEarnings)
+          .where(eq(redeemableEarnings.user_id, sourceUser.id))
+          .for("update")
+          .limit(1);
+        if (earnings) earningsAvailable = new Decimal(earnings.available_balance);
+      }
     }
 
     const settled =

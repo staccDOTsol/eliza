@@ -9,7 +9,11 @@
 import { Hono } from "hono";
 
 import { safeUnknownErrorMessage } from "@/lib/api/cloud-worker-errors";
-import { requireCurrentBillingManagerSession } from "@/lib/auth/workers-hono-auth";
+import {
+  requireAdmin,
+  requireCurrentBillingManagerSession,
+  requireUserOrApiKeyWithOrg,
+} from "@/lib/auth/workers-hono-auth";
 import { forwardMcpUpstreamRequest } from "@/lib/mcp/mcp-upstream-forward";
 import {
   callPlatformCloudMcpTool,
@@ -60,7 +64,12 @@ const CONFIGURED_UPSTREAM_NON_MUTATING_METHODS = new Set([
 
 type ConfiguredUpstreamClassification =
   | { kind: "non_mutating"; id: unknown }
-  | { kind: "privileged_mutation"; id: unknown }
+  | {
+      kind: "tool";
+      id: unknown;
+      authority: "member" | "billing_manager" | "admin";
+      effect: "read" | "mutation";
+    }
   | { kind: "invalid"; id: unknown; message: string };
 
 /**
@@ -73,13 +82,83 @@ export function classifyConfiguredUpstreamMessage(
   if (!message || typeof message !== "object" || Array.isArray(message)) {
     return { kind: "invalid", id: null, message: "Invalid JSON-RPC request" };
   }
-  const request = message as { id?: unknown; method?: unknown };
+  const request = message as {
+    id?: unknown;
+    method?: unknown;
+    params?: { name?: unknown; arguments?: unknown };
+  };
   const id = request.id ?? null;
   if (typeof request.method !== "string" || request.method.length === 0) {
     return { kind: "invalid", id, message: "JSON-RPC method is required" };
   }
   if (request.method === "tools/call") {
-    return { kind: "privileged_mutation", id };
+    if (
+      typeof request.params?.name !== "string" ||
+      request.params.name.length === 0
+    ) {
+      return {
+        kind: "invalid",
+        id,
+        message: "tools/call params.name is required",
+      };
+    }
+    const definition = listPlatformCloudMcpTools().find(
+      (tool) => tool.name === request.params?.name,
+    );
+    if (!definition) {
+      return {
+        kind: "invalid",
+        id,
+        message: `Unknown configured-upstream tool: ${request.params.name}`,
+      };
+    }
+    const input =
+      request.params.arguments &&
+      typeof request.params.arguments === "object" &&
+      !Array.isArray(request.params.arguments)
+        ? (request.params.arguments as Record<string, unknown>)
+        : {};
+    const nested =
+      input.params &&
+      typeof input.params === "object" &&
+      !Array.isArray(input.params)
+        ? (input.params as Record<string, unknown>)
+        : {};
+    const requestedMethod =
+      typeof input.method === "string"
+        ? input.method.toUpperCase()
+        : typeof nested.method === "string"
+          ? nested.method.toUpperCase()
+          : undefined;
+    const requestedEffect =
+      requestedMethod === undefined
+        ? undefined
+        : requestedMethod === "GET" || requestedMethod === "HEAD"
+          ? "read"
+          : "mutation";
+    if (
+      requestedEffect !== undefined &&
+      definition.access.effect !== "dynamic" &&
+      requestedEffect !== definition.access.effect
+    ) {
+      return {
+        kind: "invalid",
+        id,
+        message: `Tool ${definition.name} does not permit a ${requestedEffect} method override`,
+      };
+    }
+    const effect =
+      requestedEffect !== undefined
+        ? requestedEffect
+        : definition.access.effect === "dynamic"
+          ? "mutation"
+          : definition.access.effect;
+    return {
+      kind: "tool",
+      id,
+      effect,
+      authority: effect === "read" ? "member" : definition.access.authority,
+    };
   }
   if (CONFIGURED_UPSTREAM_NON_MUTATING_METHODS.has(request.method)) {
     return { kind: "non_mutating", id };
@@ -110,21 +189,24 @@ async function authorizeConfiguredUpstreamMessages(
     );
     return c.json(Array.isArray(body) ? errors : errors[0], 400);
   }
-  if (!classifications.some((entry) => entry.kind === "privileged_mutation"))
-    return null;
+  const tools = classifications.filter((entry) => entry.kind === "tool");
+  if (tools.length === 0) return null;
 
   try {
-    await requireCurrentBillingManagerSession(c);
+    if (tools.some((entry) => entry.authority === "admin")) {
+      await requireAdmin(c);
+    } else if (tools.some((entry) => entry.authority === "billing_manager")) {
+      await requireCurrentBillingManagerSession(c);
+    } else {
+      await requireUserOrApiKeyWithOrg(c);
+    }
     return null;
   } catch (error) {
     // error-policy:J1 the MCP transport boundary returns a JSON-RPC denial and
     // never forwards the privileged envelope or credential-bearing request.
-    logger.error(
-      "[MCP] Configured-upstream privileged mutation authorization failed",
-      {
-        error: error instanceof Error ? error.message : String(error),
-      },
-    );
+    logger.error("[MCP] Configured-upstream tool authorization failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
     const message = safeUnknownErrorMessage(error);
     const errors = messages.map((entry) => {
       const id =

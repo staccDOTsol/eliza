@@ -6,12 +6,16 @@
 import { beforeEach, describe, expect, mock, test } from "bun:test";
 
 const requireCurrentBillingManagerSession = mock();
+const requireUserOrApiKeyWithOrg = mock();
+const requireAdmin = mock();
 const forwardMcpUpstreamRequest = mock(async () =>
   Response.json({ forwarded: true }),
 );
 
 mock.module("@/lib/auth/workers-hono-auth", () => ({
   requireCurrentBillingManagerSession,
+  requireUserOrApiKeyWithOrg,
+  requireAdmin,
 }));
 
 mock.module("@/lib/mcp/mcp-upstream-forward", () => ({
@@ -20,7 +24,24 @@ mock.module("@/lib/mcp/mcp-upstream-forward", () => ({
 
 mock.module("@/lib/mcp/platform-cloud-tools", () => ({
   callPlatformCloudMcpTool: mock(),
-  listPlatformCloudMcpTools: () => [],
+  listPlatformCloudMcpTools: () => [
+    {
+      name: "cloud.billing.cancel_resource",
+      access: { effect: "mutation", authority: "billing_manager" },
+    },
+    {
+      name: "cloud.billing.active_resources",
+      access: { effect: "read", authority: "member" },
+    },
+    {
+      name: "cloud.api.request",
+      access: { effect: "dynamic", authority: "billing_manager" },
+    },
+    {
+      name: "cloud.admin.request",
+      access: { effect: "dynamic", authority: "admin" },
+    },
+  ],
 }));
 
 mock.module("@/lib/utils/logger", () => ({
@@ -34,6 +55,8 @@ const env = {
 
 beforeEach(() => {
   requireCurrentBillingManagerSession.mockReset();
+  requireUserOrApiKeyWithOrg.mockReset();
+  requireAdmin.mockReset();
   forwardMcpUpstreamRequest.mockClear();
 });
 
@@ -169,20 +192,70 @@ describe("configured platform MCP billing cancellation authority", () => {
     expect(forwardMcpUpstreamRequest).toHaveBeenCalledTimes(1);
   });
 
-  test("does not gate unrelated upstream MCP calls", async () => {
+  test("does not gate protocol discovery calls", async () => {
     await post({ jsonrpc: "2.0", id: 1, method: "tools/list" });
 
     expect(requireCurrentBillingManagerSession).not.toHaveBeenCalled();
     expect(forwardMcpUpstreamRequest).toHaveBeenCalledTimes(1);
   });
 
-  test("gates unknown, versioned, and alternate-shape tool vocabulary", async () => {
-    requireCurrentBillingManagerSession.mockRejectedValue(
-      Object.assign(new Error("A signed-in user session is required"), {
-        status: 401,
-      }),
+  test("allows member and API-key read tools through the catalog", async () => {
+    requireUserOrApiKeyWithOrg.mockResolvedValue({
+      id: "member-1",
+      organization_id: "org-1",
+      role: "member",
+    });
+    const response = await post(
+      {
+        jsonrpc: "2.0",
+        id: "read",
+        method: "tools/call",
+        params: { name: "cloud.billing.active_resources", arguments: {} },
+      },
+      { "x-api-key": "eliza_live_key" },
     );
+    expect(response.status).toBe(200);
+    expect(requireUserOrApiKeyWithOrg).toHaveBeenCalledTimes(1);
+    expect(requireCurrentBillingManagerSession).not.toHaveBeenCalled();
+    expect(forwardMcpUpstreamRequest).toHaveBeenCalledTimes(1);
+  });
 
+  test("a method override cannot disguise a mutation as a catalogued read", async () => {
+    const response = await post({
+      jsonrpc: "2.0",
+      id: "override",
+      method: "tools/call",
+      params: {
+        name: "cloud.billing.active_resources",
+        arguments: { params: { method: "POST" } },
+      },
+    });
+    expect(response.status).toBe(400);
+    expect(requireCurrentBillingManagerSession).not.toHaveBeenCalled();
+    expect(requireUserOrApiKeyWithOrg).not.toHaveBeenCalled();
+    expect(forwardMcpUpstreamRequest).not.toHaveBeenCalled();
+  });
+
+  test("uses admin authority for catalogued admin mutations", async () => {
+    requireAdmin.mockResolvedValue({
+      user: { id: "admin-1" },
+      role: "super_admin",
+    });
+    await post({
+      jsonrpc: "2.0",
+      id: "admin",
+      method: "tools/call",
+      params: {
+        name: "cloud.admin.request",
+        arguments: { method: "POST", path: "/api/admin/test" },
+      },
+    });
+    expect(requireAdmin).toHaveBeenCalledTimes(1);
+    expect(requireCurrentBillingManagerSession).not.toHaveBeenCalled();
+    expect(forwardMcpUpstreamRequest).toHaveBeenCalledTimes(1);
+  });
+
+  test("denies unknown, versioned, and alternate-shape tool vocabulary", async () => {
     for (const request of [
       {
         jsonrpc: "2.0",
@@ -207,10 +280,10 @@ describe("configured platform MCP billing cancellation authority", () => {
       },
     ]) {
       const response = await post(request);
-      expect(response.status).toBe(200);
+      expect(response.status).toBe(400);
     }
 
-    expect(requireCurrentBillingManagerSession).toHaveBeenCalledTimes(3);
+    expect(requireCurrentBillingManagerSession).not.toHaveBeenCalled();
     expect(forwardMcpUpstreamRequest).not.toHaveBeenCalled();
   });
 
@@ -250,7 +323,7 @@ describe("configured platform MCP billing cancellation authority", () => {
     expect(forwardMcpUpstreamRequest).not.toHaveBeenCalled();
   });
 
-  test("gates direct, alias, and generic cancellation on non-root upstream paths", async () => {
+  test("gates catalogued direct and generic cancellation and rejects an unknown alias", async () => {
     requireCurrentBillingManagerSession.mockRejectedValue(
       Object.assign(new Error("A signed-in user session is required"), {
         status: 401,
@@ -277,7 +350,7 @@ describe("configured platform MCP billing cancellation authority", () => {
       );
     }
 
-    expect(requireCurrentBillingManagerSession).toHaveBeenCalledTimes(3);
+    expect(requireCurrentBillingManagerSession).toHaveBeenCalledTimes(2);
     expect(forwardMcpUpstreamRequest).not.toHaveBeenCalled();
   });
 });

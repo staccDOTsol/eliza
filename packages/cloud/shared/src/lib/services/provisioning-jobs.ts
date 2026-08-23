@@ -2098,9 +2098,10 @@ export class ProvisioningJobService {
             ...(isDeletionContinuation(sandbox)
               ? {}
               : { deletion_allocation_counted: holdsCountedNodeSlot(sandbox) }),
-            billing_status: "suspended" as const,
-            scheduled_shutdown_at: null,
-            shutdown_warning_sent_at: null,
+            // Provider ownership is not provider absence. Keep the existing
+            // billing clock live until executeAgentDelete proves the workload
+            // is gone and removes this row. Failure and timeout writebacks
+            // retain the row, so they also retain the charge authority.
             ...(isRecoveryReEnqueue ? {} : { error_count: 0 }),
             updated_at: new Date(),
           })

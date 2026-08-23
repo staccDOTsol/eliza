@@ -111,6 +111,7 @@ async function seedAgent(
     deletedAt?: Date | null;
     deletionAttemptId?: string | null;
     deletionStartedAt?: Date | null;
+    status?: "running" | "deletion_pending" | "deletion_failed";
   } = {},
 ): Promise<string> {
   const {
@@ -119,6 +120,7 @@ async function seedAgent(
     deletedAt = null,
     deletionAttemptId = null,
     deletionStartedAt = null,
+    status = "running",
   } = options;
   const [row] = await dbWrite
     .insert(agentSandboxes)
@@ -126,7 +128,7 @@ async function seedAgent(
       organization_id: organizationId,
       user_id: userId,
       agent_name: poolStatus === null ? `${executionTier}-agent` : "sentinel-capacity",
-      status: "running",
+      status,
       execution_tier: executionTier as never,
       pool_status: poolStatus,
       deleted_at: deletedAt,
@@ -148,6 +150,7 @@ async function seedDedicated(poolStatus: "unclaimed" | null): Promise<string> {
 async function expectSuspendAuthorityConflict(
   agentId: string,
   mutateAuthority: () => Promise<void>,
+  remainsBillable = false,
 ): Promise<void> {
   enqueueSuspendMutation = mutateAuthority;
 
@@ -167,11 +170,11 @@ async function expectSuspendAuthorityConflict(
     .from(agentSandboxes)
     .where(eq(agentSandboxes.id, agentId));
   expect(stored.billing_status).toBe("active");
-  expect(
-    (await activeBillingService.listActiveResources(organizationId)).map(
-      (resource) => resource.resourceId,
-    ),
-  ).not.toContain(agentId);
+  const listed = (await activeBillingService.listActiveResources(organizationId)).map(
+    (resource) => resource.resourceId,
+  );
+  if (remainsBillable) expect(listed).toContain(agentId);
+  else expect(listed).not.toContain(agentId);
 }
 
 describe("active billing warm-pool authority", () => {
@@ -296,18 +299,19 @@ describe("active billing warm-pool authority", () => {
     }
   });
 
-  test("soft-deleted and deletion-owned rows are neither listed nor cancellable", async () => {
+  test("soft-deleted rows disappear while deletion-owned provider compute stays visible", async () => {
     const deletedId = await seedAgent({ deletedAt: new Date("2026-08-22T10:00:00.000Z") });
     const deletionOwnedId = await seedAgent({
       deletionAttemptId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       deletionStartedAt: new Date("2026-08-22T10:00:00.000Z"),
+      status: "deletion_pending",
     });
 
     const listedIds = (await activeBillingService.listActiveResources(organizationId)).map(
       (resource) => resource.resourceId,
     );
     expect(listedIds).not.toContain(deletedId);
-    expect(listedIds).not.toContain(deletionOwnedId);
+    expect(listedIds).toContain(deletionOwnedId);
 
     for (const resourceId of [deletedId, deletionOwnedId]) {
       await expect(
@@ -355,15 +359,19 @@ describe("active billing warm-pool authority", () => {
   test("a concurrent deletion attempt wins over billing suspension", async () => {
     const agentId = await seedDedicated(null);
 
-    await expectSuspendAuthorityConflict(agentId, async () => {
-      await dbWrite
-        .update(agentSandboxes)
-        .set({
-          deletion_attempt_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-          deletion_started_at: new Date("2026-08-22T10:00:00.000Z"),
-        })
-        .where(eq(agentSandboxes.id, agentId));
-    });
+    await expectSuspendAuthorityConflict(
+      agentId,
+      async () => {
+        await dbWrite
+          .update(agentSandboxes)
+          .set({
+            deletion_attempt_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            deletion_started_at: new Date("2026-08-22T10:00:00.000Z"),
+          })
+          .where(eq(agentSandboxes.id, agentId));
+      },
+      true,
+    );
   });
 
   test("a concurrent soft deletion wins over billing suspension", async () => {

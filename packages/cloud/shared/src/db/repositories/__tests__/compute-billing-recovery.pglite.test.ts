@@ -1266,6 +1266,75 @@ describe("compute billing recovery", () => {
     expect(intent?.provider_confirmed_at).toBeInstanceOf(Date);
     providerStop.mockRestore();
   });
+
+  test("a claimed billing job rereads a later explicit-user upgrade before provider action", async () => {
+    const { org, user } = await seed("0.000000");
+    const containerId = "00000000-0000-4000-8000-000000000007";
+    const periodStart = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    await dbWrite.execute(sql`INSERT INTO containers
+      (id, name, project_name, organization_id, user_id, status, billing_status,
+       scheduled_shutdown_at, last_billed_at, lifecycle_revision, created_at, updated_at)
+      VALUES (${containerId}, 'claimed-upgrade', 'claimed-upgrade', ${org.id}, ${user.id},
+        'running', 'shutdown_pending', ${new Date(0)}, ${periodStart}, 12,
+        ${periodStart}, ${periodStart})`);
+    await dbWrite.insert(computeBillingRateSegments).values({
+      organization_id: org.id,
+      workload_kind: "container",
+      workload_id: containerId,
+      lifecycle_revision: 12,
+      billing_state: "running",
+      rate_per_hour: "0.027917",
+      effective_at: periodStart,
+    });
+    const billing = await enqueueContainerStopOnce({
+      containerId,
+      organizationId: org.id,
+      authorization: "billing_request",
+    });
+    if (!billing.requested) throw new Error("Expected billing stop request");
+    const [hydratedBeforeUpgrade] = await dbWrite
+      .update(jobs)
+      .set({ status: "in_progress" })
+      .where(eq(jobs.id, billing.id))
+      .returning();
+    expect(hydratedBeforeUpgrade.data).toMatchObject({ authorization: "billing_request" });
+
+    await dbWrite
+      .update(organizations)
+      .set({ credit_balance: "10.000000" })
+      .where(eq(organizations.id, org.id));
+    const manual = await enqueueContainerStopOnce({
+      containerId,
+      organizationId: org.id,
+      authorization: "user_request",
+    });
+    expect(manual).toMatchObject({ requested: true, id: billing.id, created: false });
+    const [upgraded] = await dbWrite.select().from(jobs).where(eq(jobs.id, billing.id));
+    expect(upgraded.data).toMatchObject({ authorization: "user_request" });
+
+    const providerStop = spyOn(
+      getHetznerContainersClient(),
+      "stopContainerRuntimeForBilling",
+    ).mockResolvedValue({ nodeId: null });
+    try {
+      await expect(dispatchContainerStopJob(hydratedBeforeUpgrade)).resolves.toEqual({
+        stopped: true,
+      });
+      expect(providerStop).toHaveBeenCalledTimes(1);
+      const [stored] = await dbWrite
+        .select()
+        .from(containers)
+        .where(eq(containers.id, containerId));
+      expect(stored).toMatchObject({ status: "stopped", billing_status: "suspended" });
+      const [intent] = await dbWrite
+        .select()
+        .from(containerComputeStopIntents)
+        .where(eq(containerComputeStopIntents.container_id, containerId));
+      expect(intent).toMatchObject({ status: "provider_confirmed" });
+    } finally {
+      providerStop.mockRestore();
+    }
+  });
 });
 
 test("PGlite setup is mandatory", () => expect(ready).toBe(true));

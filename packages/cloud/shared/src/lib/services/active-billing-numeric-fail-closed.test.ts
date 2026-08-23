@@ -172,6 +172,7 @@ const baseAgent = (overrides: Record<string, unknown> = {}) => ({
   user_id: "agent-user",
   status: "running",
   billing_status: "active",
+  billingStatus: "active",
   total_billed: "3.00",
   hourly_rate: "0.0100",
   character_id: "char-1",
@@ -184,6 +185,7 @@ const baseAgent = (overrides: Record<string, unknown> = {}) => ({
   lifecycle_revision: 1,
   pool_status: null,
   deletion_attempt_id: null,
+  deletionAttemptId: null,
   deleted_at: null,
   ...overrides,
 });

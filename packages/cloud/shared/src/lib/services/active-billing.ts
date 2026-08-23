@@ -11,6 +11,7 @@ import { type Database, dbRead, dbWrite } from "../../db/client";
 import { agentSandboxes, CONTAINER_BACKED_EXECUTION_TIERS } from "../../db/schemas/agent-sandboxes";
 import { containers } from "../../db/schemas/containers";
 import { creditTransactions } from "../../db/schemas/credit-transactions";
+import { jobs } from "../../db/schemas/jobs";
 import type { AppEnv } from "../../types/cloud-worker-env";
 import { ApiError } from "../api/cloud-worker-errors";
 import { AGENT_PRICING } from "../constants/agent-pricing";
@@ -94,6 +95,15 @@ function activeBillingAgentAuthorityPredicate() {
   );
 }
 
+/** Selects compute that can still exist at the provider, including deletion attempts. */
+function billableAgentAuthorityPredicate() {
+  return and(
+    inArray(agentSandboxes.execution_tier, [...CONTAINER_BACKED_EXECUTION_TIERS]),
+    isNull(agentSandboxes.pool_status),
+    isNull(agentSandboxes.deleted_at),
+  );
+}
+
 function detectLedgerResource(metadata: Record<string, unknown>): {
   resourceType: BillingLedgerEntry["resourceType"];
   resourceId: string | null;
@@ -149,10 +159,10 @@ class ActiveBillingService {
         .where(
           and(
             eq(agentSandboxes.organization_id, organizationId),
-            activeBillingAgentAuthorityPredicate(),
+            billableAgentAuthorityPredicate(),
             inArray(agentSandboxes.billing_status, ["active", "warning", "shutdown_pending"]),
             or(
-              eq(agentSandboxes.status, "running"),
+              inArray(agentSandboxes.status, ["running", "deletion_pending", "deletion_failed"]),
               and(eq(agentSandboxes.status, "stopped"), isNotNull(agentSandboxes.last_backup_at)),
             ),
           ),
@@ -424,14 +434,27 @@ class ActiveBillingService {
           triggerEnv,
         );
         const [currentAuthority] = await dbWrite
-          .select({ id: agentSandboxes.id })
+          .select({
+            id: agentSandboxes.id,
+            status: agentSandboxes.status,
+            billingStatus: agentSandboxes.billing_status,
+            deletionAttemptId: agentSandboxes.deletion_attempt_id,
+          })
           .from(agentSandboxes)
           .where(
             and(
               eq(agentSandboxes.id, resourceId),
               eq(agentSandboxes.organization_id, organizationId),
-              eq(agentSandboxes.lifecycle_revision, agent.lifecycle_revision),
-              activeBillingAgentAuthorityPredicate(),
+              mode === "delete"
+                ? and(
+                    eq(agentSandboxes.status, "deletion_pending"),
+                    isNotNull(agentSandboxes.deletion_attempt_id),
+                    billableAgentAuthorityPredicate(),
+                  )
+                : and(
+                    eq(agentSandboxes.lifecycle_revision, agent.lifecycle_revision),
+                    activeBillingAgentAuthorityPredicate(),
+                  ),
             ),
           )
           .limit(1);
@@ -440,6 +463,35 @@ class ActiveBillingService {
             409,
             "session_not_ready",
             "Managed agent billing authority changed during cancellation",
+          );
+        }
+        if (mode === "delete") {
+          const [committedJob] = await dbWrite
+            .select({ id: jobs.id })
+            .from(jobs)
+            .where(
+              and(
+                eq(jobs.id, cancellation.job.id),
+                eq(jobs.type, "agent_delete"),
+                eq(jobs.organization_id, organizationId),
+                eq(jobs.agent_id, agent.id),
+                inArray(jobs.status, ["pending", "in_progress"]),
+              ),
+            )
+            .limit(1);
+          if (!committedJob) {
+            throw new ApiError(
+              409,
+              "session_not_ready",
+              "Managed agent delete job changed during cancellation",
+            );
+          }
+        }
+        if (mode === "delete" && currentAuthority.billingStatus === "suspended") {
+          throw new ApiError(
+            409,
+            "session_not_ready",
+            "Managed agent deletion lost billable provider authority",
           );
         }
         const infrastructureAction: InfrastructureCancellationAction = {
@@ -458,7 +510,7 @@ class ActiveBillingService {
             resourceId: agent.id,
             name: agent.agent_name ?? agent.id,
             status: mode === "delete" ? "deletion_pending" : agent.status,
-            billingStatus: agent.billing_status,
+            billingStatus: currentAuthority.billingStatus,
             unitPrice,
             billingInterval: "hour",
             lastBilledAt: iso(agent.last_billed_at),
@@ -472,6 +524,9 @@ class ActiveBillingService {
             metadata: {
               characterId: agent.character_id,
               cancellationId: cancellation.job.id,
+              ...(mode === "delete"
+                ? { deletionAttemptId: currentAuthority.deletionAttemptId }
+                : {}),
               cancellationRequestedAt: now.toISOString(),
               mode,
               infrastructureAction,

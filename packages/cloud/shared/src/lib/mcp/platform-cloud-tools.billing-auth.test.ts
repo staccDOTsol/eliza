@@ -102,6 +102,12 @@ describe("platform MCP billing cancellation authority", () => {
       modes: ["session"],
       organizationRoles: ["owner", "admin"],
     });
+    expect(tool?.access).toEqual({ effect: "mutation", authority: "billing_manager" });
+    expect(
+      listPlatformCloudMcpTools().find(
+        (candidate) => candidate.name === "cloud.billing.active_resources",
+      )?.access,
+    ).toEqual({ effect: "read", authority: "member" });
   });
 
   test("uses the current authorized tenant and rechecks before infrastructure", async () => {
