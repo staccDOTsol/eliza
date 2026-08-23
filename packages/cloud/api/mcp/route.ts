@@ -153,11 +153,17 @@ export function classifyConfiguredUpstreamMessage(
         : definition.access.effect === "dynamic"
           ? "mutation"
           : definition.access.effect;
+    const authority =
+      definition.access.effect === "dynamic" &&
+      definition.access.authority === "billing_manager" &&
+      effect === "read"
+        ? "member"
+        : definition.access.authority;
     return {
       kind: "tool",
       id,
       effect,
-      authority: effect === "read" ? "member" : definition.access.authority,
+      authority,
     };
   }
   if (CONFIGURED_UPSTREAM_NON_MUTATING_METHODS.has(request.method)) {

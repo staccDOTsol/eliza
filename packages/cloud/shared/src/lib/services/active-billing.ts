@@ -433,59 +433,55 @@ class ActiveBillingService {
           mode,
           triggerEnv,
         );
-        const [currentAuthority] = await dbWrite
-          .select({
-            id: agentSandboxes.id,
-            status: agentSandboxes.status,
-            billingStatus: agentSandboxes.billing_status,
-            deletionAttemptId: agentSandboxes.deletion_attempt_id,
-          })
-          .from(agentSandboxes)
-          .where(
-            and(
-              eq(agentSandboxes.id, resourceId),
-              eq(agentSandboxes.organization_id, organizationId),
-              mode === "delete"
-                ? and(
+        const authoritySelection = {
+          id: agentSandboxes.id,
+          status: agentSandboxes.status,
+          billingStatus: agentSandboxes.billing_status,
+          deletionAttemptId: agentSandboxes.deletion_attempt_id,
+        };
+        const [currentAuthority] =
+          mode === "delete"
+            ? await dbWrite
+                .select(authoritySelection)
+                .from(agentSandboxes)
+                .innerJoin(
+                  jobs,
+                  and(
+                    eq(jobs.id, cancellation.job.id),
+                    eq(jobs.type, "agent_delete"),
+                    eq(jobs.organization_id, organizationId),
+                    eq(jobs.agent_id, agent.id),
+                    inArray(jobs.status, ["pending", "in_progress"]),
+                  ),
+                )
+                .where(
+                  and(
+                    eq(agentSandboxes.id, resourceId),
+                    eq(agentSandboxes.organization_id, organizationId),
                     eq(agentSandboxes.status, "deletion_pending"),
                     isNotNull(agentSandboxes.deletion_attempt_id),
                     billableAgentAuthorityPredicate(),
-                  )
-                : and(
+                  ),
+                )
+                .limit(1)
+            : await dbWrite
+                .select(authoritySelection)
+                .from(agentSandboxes)
+                .where(
+                  and(
+                    eq(agentSandboxes.id, resourceId),
+                    eq(agentSandboxes.organization_id, organizationId),
                     eq(agentSandboxes.lifecycle_revision, agent.lifecycle_revision),
                     activeBillingAgentAuthorityPredicate(),
                   ),
-            ),
-          )
-          .limit(1);
+                )
+                .limit(1);
         if (!currentAuthority) {
           throw new ApiError(
             409,
             "session_not_ready",
             "Managed agent billing authority changed during cancellation",
           );
-        }
-        if (mode === "delete") {
-          const [committedJob] = await dbWrite
-            .select({ id: jobs.id })
-            .from(jobs)
-            .where(
-              and(
-                eq(jobs.id, cancellation.job.id),
-                eq(jobs.type, "agent_delete"),
-                eq(jobs.organization_id, organizationId),
-                eq(jobs.agent_id, agent.id),
-                inArray(jobs.status, ["pending", "in_progress"]),
-              ),
-            )
-            .limit(1);
-          if (!committedJob) {
-            throw new ApiError(
-              409,
-              "session_not_ready",
-              "Managed agent delete job changed during cancellation",
-            );
-          }
         }
         if (mode === "delete" && currentAuthority.billingStatus === "suspended") {
           throw new ApiError(

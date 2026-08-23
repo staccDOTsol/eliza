@@ -220,6 +220,42 @@ describe("configured platform MCP billing cancellation authority", () => {
     expect(forwardMcpUpstreamRequest).toHaveBeenCalledTimes(1);
   });
 
+  test("allows member generic reads but preserves admin authority for admin reads", async () => {
+    requireUserOrApiKeyWithOrg.mockResolvedValue({
+      id: "member-1",
+      organization_id: "org-1",
+      role: "member",
+    });
+    requireAdmin.mockResolvedValue({
+      user: { id: "admin-1" },
+      role: "super_admin",
+    });
+
+    await post({
+      jsonrpc: "2.0",
+      id: "generic-read",
+      method: "tools/call",
+      params: {
+        name: "cloud.api.request",
+        arguments: { method: "GET", path: "/api/v1/containers" },
+      },
+    });
+    await post({
+      jsonrpc: "2.0",
+      id: "admin-read",
+      method: "tools/call",
+      params: {
+        name: "cloud.admin.request",
+        arguments: { method: "GET", path: "/api/admin/test" },
+      },
+    });
+
+    expect(requireUserOrApiKeyWithOrg).toHaveBeenCalledTimes(1);
+    expect(requireAdmin).toHaveBeenCalledTimes(1);
+    expect(requireCurrentBillingManagerSession).not.toHaveBeenCalled();
+    expect(forwardMcpUpstreamRequest).toHaveBeenCalledTimes(2);
+  });
+
   test("a method override cannot disguise a mutation as a catalogued read", async () => {
     const response = await post({
       jsonrpc: "2.0",
