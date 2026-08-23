@@ -11,6 +11,7 @@ process.env.DATABASE_URL = "pglite://memory";
 process.env.TEST_DATABASE_URL = "pglite://memory";
 process.env.NODE_ENV ||= "test";
 
+import { retireContainerWithDeleteJob } from "../../../lib/services/container-retirement";
 import {
   dispatchContainerStopJob,
   enqueueContainerStopOnce,
@@ -41,6 +42,7 @@ import { userCharacters } from "../../schemas/user-characters";
 import { users } from "../../schemas/users";
 import { agentBillingRepository } from "../agent-billing";
 import { agentBillingRunRepository } from "../agent-billing-runs";
+import { containerBillingRepository } from "../container-billing";
 import { containersRepository } from "../containers";
 
 const PGLITE_TIMEOUT = 60_000;
@@ -769,6 +771,114 @@ describe("compute billing recovery", () => {
       sql.raw(`SELECT organization_id FROM jobs ORDER BY organization_id`),
     );
     expect(rows.rows).toHaveLength(1);
+  });
+
+  test("explicit funded cancellation is one durable receipt across concurrency and replay", async () => {
+    const { org, user } = await seed("10.000000");
+    const containerId = "00000000-0000-4000-8000-000000000011";
+    const periodStart = new Date("2026-08-19T01:00:00.000Z");
+    await dbWrite.execute(sql`INSERT INTO containers
+      (id, name, project_name, organization_id, user_id, status, billing_status,
+       last_billed_at, lifecycle_revision, created_at, updated_at)
+      VALUES (${containerId}, 'user-stop', 'user-stop', ${org.id}, ${user.id}, 'running', 'active',
+        ${periodStart}, 31, ${periodStart}, ${periodStart})`);
+
+    const receipts = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        enqueueContainerStopOnce({
+          containerId,
+          organizationId: org.id,
+          userId: user.id,
+          authorization: "user_request",
+        }),
+      ),
+    );
+    expect(receipts.every((receipt) => receipt.requested)).toBe(true);
+    const ids = receipts.flatMap((receipt) => (receipt.requested ? [receipt.id] : []));
+    expect(new Set(ids).size).toBe(1);
+    expect(receipts.filter((receipt) => receipt.created)).toHaveLength(1);
+
+    const [storedJob] = await dbWrite.select().from(jobs).where(eq(jobs.id, ids[0]));
+    expect(storedJob.data).toMatchObject({ authorization: "user_request" });
+    const [storedContainer] = await dbWrite
+      .select({
+        status: containers.status,
+        billingStatus: containers.billing_status,
+        scheduledShutdownAt: containers.scheduled_shutdown_at,
+      })
+      .from(containers)
+      .where(eq(containers.id, containerId));
+    expect(storedContainer).toMatchObject({
+      status: "running",
+      billingStatus: "shutdown_pending",
+    });
+    expect(storedContainer.scheduledShutdownAt).toBeInstanceOf(Date);
+    expect(await dbWrite.select().from(containerComputeStopIntents)).toHaveLength(1);
+    expect(await dbWrite.select().from(jobs)).toHaveLength(1);
+  });
+
+  test("explicit provider failure keeps billing unsettled and reuses the recovery intent", async () => {
+    const { org, user } = await seed("10.000000");
+    const containerId = "00000000-0000-4000-8000-000000000012";
+    const periodStart = new Date("2026-08-19T01:00:00.000Z");
+    await dbWrite.execute(sql`INSERT INTO containers
+      (id, name, project_name, organization_id, user_id, status, billing_status,
+       last_billed_at, lifecycle_revision, created_at, updated_at)
+      VALUES (${containerId}, 'user-stop-failure', 'user-stop-failure', ${org.id}, ${user.id},
+        'running', 'active', ${periodStart}, 32, ${periodStart}, ${periodStart})`);
+    const requested = await enqueueContainerStopOnce({
+      containerId,
+      organizationId: org.id,
+      userId: user.id,
+      authorization: "user_request",
+    });
+    if (!requested.requested) throw new Error("Expected explicit stop request");
+    const [job] = await dbWrite.select().from(jobs).where(eq(jobs.id, requested.id));
+    const providerStop = spyOn(
+      getHetznerContainersClient(),
+      "stopContainerRuntimeForBilling",
+    ).mockRejectedValue(new Error("fixture provider unavailable"));
+
+    await expect(dispatchContainerStopJob(job)).rejects.toThrow("fixture provider unavailable");
+    const replay = await enqueueContainerStopOnce({
+      containerId,
+      organizationId: org.id,
+      userId: user.id,
+      authorization: "user_request",
+    });
+    expect(replay).toEqual({ requested: true, id: requested.id, created: false });
+    expect(providerStop).toHaveBeenCalledTimes(1);
+    const [storedContainer] = await dbWrite
+      .select({ status: containers.status, billingStatus: containers.billing_status })
+      .from(containers)
+      .where(eq(containers.id, containerId));
+    expect(storedContainer).toEqual({ status: "running", billingStatus: "shutdown_pending" });
+    const [intent] = await dbWrite.select().from(containerComputeStopIntents);
+    expect(intent).toMatchObject({ status: "retry", attempts: 1, job_id: requested.id });
+    providerStop.mockRestore();
+  });
+
+  test("durable delete ownership remains billable until daemon confirmation", async () => {
+    const { org, user } = await seed("10.000000");
+    const containerId = "00000000-0000-4000-8000-000000000013";
+    const periodStart = new Date("2026-08-19T01:00:00.000Z");
+    await dbWrite.execute(sql`INSERT INTO containers
+      (id, name, project_name, organization_id, user_id, status, billing_status,
+       last_billed_at, next_billing_at, lifecycle_revision, created_at, updated_at)
+      VALUES (${containerId}, 'user-delete', 'user-delete', ${org.id}, ${user.id}, 'running',
+        'active', ${periodStart}, ${new Date(0)}, 33, ${periodStart}, ${periodStart})`);
+
+    const retirement = await retireContainerWithDeleteJob(containerId, org.id);
+    expect(retirement).toMatchObject({ outcome: "retired", jobId: expect.any(String) });
+    const due = await containerBillingRepository.listBillableContainers(new Date());
+    expect(due.map((row) => row.id)).toContain(containerId);
+
+    await dbWrite
+      .update(containers)
+      .set({ status: "deleted" })
+      .where(eq(containers.id, containerId));
+    const terminal = await containerBillingRepository.listBillableContainers(new Date());
+    expect(terminal.map((row) => row.id)).not.toContain(containerId);
   });
 
   test("funding restored under the stop-decision locks reactivates without a provider job", async () => {

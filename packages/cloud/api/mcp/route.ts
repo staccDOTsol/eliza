@@ -43,63 +43,88 @@ function jsonRpcError(id: unknown, code: number, message: string) {
   };
 }
 
-function isBillingCancellationCall(message: unknown): boolean {
-  if (!message || typeof message !== "object" || Array.isArray(message))
-    return false;
-  const request = message as {
-    method?: unknown;
-    params?: {
-      name?: unknown;
-      arguments?: { method?: unknown; path?: unknown };
-    };
-  };
-  if (request.method !== "tools/call") return false;
-  if (
-    request.params?.name === "cloud.billing.cancel_resource" ||
-    request.params?.name === "billing.cancel_resource"
-  ) {
-    return true;
-  }
-  if (request.params?.name !== "cloud.api.request") return false;
-  const generic = request.params.arguments;
-  if (
-    typeof generic?.method !== "string" ||
-    generic.method.toUpperCase() !== "POST"
-  ) {
-    return false;
-  }
-  if (typeof generic.path !== "string" || !generic.path.startsWith("/api/"))
-    return false;
+const CONFIGURED_UPSTREAM_NON_MUTATING_METHODS = new Set([
+  "initialize",
+  "ping",
+  "tools/list",
+  "resources/list",
+  "resources/read",
+  "resources/templates/list",
+  "prompts/list",
+  "prompts/get",
+  "completion/complete",
+  "notifications/initialized",
+  "notifications/cancelled",
+  "notifications/progress",
+]);
 
-  try {
-    let pathname = new URL(generic.path, "https://mcp-gate.invalid").pathname;
-    for (let pass = 0; pass < 2; pass += 1) {
-      const decoded = decodeURIComponent(pathname);
-      if (decoded === pathname) break;
-      pathname = new URL(decoded, "https://mcp-gate.invalid").pathname;
-    }
-    return /^\/api\/v1\/billing\/resources\/[^/]+\/cancel\/?$/.test(pathname);
-  } catch {
-    // error-policy:J3 malformed generic paths are not trusted to bypass a
-    // privileged pre-forward gate when they still name billing cancellation.
-    return /billing/i.test(generic.path) && /cancel/i.test(generic.path);
+type ConfiguredUpstreamClassification =
+  | { kind: "non_mutating"; id: unknown }
+  | { kind: "privileged_mutation"; id: unknown }
+  | { kind: "invalid"; id: unknown; message: string };
+
+/**
+ * Positively classifies the MCP protocol envelope, independent of tool names,
+ * paths, aliases, versions, or upstream-specific argument vocabulary.
+ */
+export function classifyConfiguredUpstreamMessage(
+  message: unknown,
+): ConfiguredUpstreamClassification {
+  if (!message || typeof message !== "object" || Array.isArray(message)) {
+    return { kind: "invalid", id: null, message: "Invalid JSON-RPC request" };
   }
+  const request = message as { id?: unknown; method?: unknown };
+  const id = request.id ?? null;
+  if (typeof request.method !== "string" || request.method.length === 0) {
+    return { kind: "invalid", id, message: "JSON-RPC method is required" };
+  }
+  if (request.method === "tools/call") {
+    return { kind: "privileged_mutation", id };
+  }
+  if (CONFIGURED_UPSTREAM_NON_MUTATING_METHODS.has(request.method)) {
+    return { kind: "non_mutating", id };
+  }
+  return {
+    kind: "invalid",
+    id,
+    message: `Unsupported configured-upstream MCP method: ${request.method}`,
+  };
 }
 
-async function rejectUnauthorizedUpstreamBillingCalls(
+async function authorizeConfiguredUpstreamMessages(
   c: AppContext,
   body: unknown,
 ): Promise<Response | null> {
   const messages = Array.isArray(body) ? body : [body];
-  if (!messages.some(isBillingCancellationCall)) return null;
+  const classifications = messages.map(classifyConfiguredUpstreamMessage);
+  const invalid = classifications.filter((entry) => entry.kind === "invalid");
+  if (invalid.length > 0) {
+    const errors = classifications.map((entry) =>
+      entry.kind === "invalid"
+        ? jsonRpcError(entry.id, -32601, entry.message)
+        : jsonRpcError(
+            entry.id,
+            -32600,
+            "Batch was not forwarded because a method was unclassified",
+          ),
+    );
+    return c.json(Array.isArray(body) ? errors : errors[0], 400);
+  }
+  if (!classifications.some((entry) => entry.kind === "privileged_mutation"))
+    return null;
 
   try {
     await requireCurrentBillingManagerSession(c);
     return null;
   } catch (error) {
-    logger.error("[MCP] Upstream billing cancellation authorization failed", {
-      error: error instanceof Error ? error.message : String(error),
-    });
+    // error-policy:J1 the MCP transport boundary returns a JSON-RPC denial and
+    // never forwards the privileged envelope or credential-bearing request.
+    logger.error(
+      "[MCP] Configured-upstream privileged mutation authorization failed",
+      {
+        error: error instanceof Error ? error.message : String(error),
+      },
+    );
     const message = safeUnknownErrorMessage(error);
     const errors = messages.map((entry) => {
       const id =
@@ -116,6 +141,16 @@ async function forwardConfiguredMcpRequest(
   c: AppContext,
   upstream: string,
 ): Promise<Response> {
+  if (!["GET", "HEAD", "POST"].includes(c.req.raw.method)) {
+    return c.json(
+      jsonRpcError(
+        null,
+        -32600,
+        "Configured MCP transport only accepts GET or POST",
+      ),
+      405,
+    );
+  }
   if (
     c.req.raw.method !== "GET" &&
     c.req.raw.method !== "HEAD" &&
@@ -129,7 +164,7 @@ async function forwardConfiguredMcpRequest(
       // untrusted JSON cannot be inspected for privileged billing calls.
       return c.json(jsonRpcError(null, -32700, "Invalid JSON"), 400);
     }
-    const rejection = await rejectUnauthorizedUpstreamBillingCalls(c, body);
+    const rejection = await authorizeConfiguredUpstreamMessages(c, body);
     if (rejection) return rejection;
   }
   return forwardMcpUpstreamRequest(c.req.raw, upstream);
@@ -173,6 +208,8 @@ async function handleJsonRpc(c: AppContext, message: unknown) {
         );
         return jsonRpcResult(request.id, result);
       } catch (error) {
+        // error-policy:J1 local tool execution failures become redacted
+        // JSON-RPC errors at the transport boundary.
         // Redact: deliberate 4xx errors (auth/validation/not-found) keep their
         // message; infra/DB/5xx faults collapse to a generic string so raw SQL /
         // SQLSTATE / driver internals never reach the MCP caller. Full error is
@@ -218,6 +255,7 @@ app.post("/", async (c) => {
   try {
     body = await c.req.json();
   } catch {
+    // error-policy:J3 malformed transport JSON is rejected explicitly.
     return c.json(jsonRpcError(null, -32700, "Invalid JSON"), 400);
   }
 

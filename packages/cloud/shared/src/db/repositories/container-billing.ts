@@ -122,7 +122,7 @@ export class ContainerBillingRepository {
       .from(containers)
       .where(
         and(
-          eq(containers.status, "running"),
+          inArray(containers.status, ["running", "deleting"]),
           inArray(containers.billing_status, ["active", "warning", "shutdown_pending"]),
           or(isNull(containers.next_billing_at), lte(containers.next_billing_at, now)),
         ),

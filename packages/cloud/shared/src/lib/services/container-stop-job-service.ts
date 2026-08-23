@@ -42,6 +42,8 @@ export interface ContainerStopOutcome {
   reason?: string;
 }
 
+export type ContainerStopAuthorization = "billing_request" | "user_request";
+
 const STOP_INTENT_MAX_ORDINARY_ATTEMPTS = 3;
 const STOP_INTENT_RETRY_MS = 5 * 60 * 1000;
 
@@ -51,6 +53,7 @@ export function readContainerStopJobData(job: { data: unknown }): {
   organizationId: string;
   intentId: string;
   lifecycleRevision: number;
+  authorization: ContainerStopAuthorization;
 } {
   const data = (job.data ?? {}) as Record<string, unknown>;
   if (typeof data.containerId !== "string" || data.containerId.length === 0) {
@@ -65,11 +68,16 @@ export function readContainerStopJobData(job: { data: unknown }): {
   if (!Number.isSafeInteger(data.lifecycleRevision) || Number(data.lifecycleRevision) < 0) {
     throw new Error("CONTAINER_STOP job has invalid data.lifecycleRevision");
   }
+  const authorization = data.authorization ?? "billing_request";
+  if (authorization !== "billing_request" && authorization !== "user_request") {
+    throw new Error("CONTAINER_STOP job has invalid data.authorization");
+  }
   return {
     containerId: data.containerId,
     organizationId: data.organizationId,
     intentId: data.intentId,
     lifecycleRevision: Number(data.lifecycleRevision),
+    authorization,
   };
 }
 
@@ -86,7 +94,7 @@ export async function dispatchContainerStopJob(job: {
   organization_id?: string;
   data: unknown;
 }): Promise<ContainerStopOutcome> {
-  const { containerId, organizationId, intentId, lifecycleRevision } =
+  const { containerId, organizationId, intentId, lifecycleRevision, authorization } =
     readContainerStopJobData(job);
   if (job.organization_id !== undefined && job.organization_id !== organizationId) {
     throw new Error("CONTAINER_STOP job tenant envelope mismatch");
@@ -140,7 +148,7 @@ export async function dispatchContainerStopJob(job: {
     if (!organization) throw new Error("CONTAINER_STOP billing organization not found");
 
     let earningsAvailable = new Decimal(0);
-    if (organization.pay_as_you_go_from_earnings) {
+    if (authorization === "billing_request" && organization.pay_as_you_go_from_earnings) {
       const [sourceUser] = await tx
         .select({ id: users.id })
         .from(users)
@@ -205,18 +213,21 @@ export async function dispatchContainerStopJob(job: {
       return { outcome: { stopped: false, reason: "stale-lifecycle-generation" } };
     }
 
-    const settled = await settleComputeRateSegments(tx, {
-      organizationId,
-      workloadKind: "container",
-      workloadId: containerId,
-      periodStart: container.last_billed_at ?? container.created_at,
-      periodEnd: new Date(),
-    });
+    const settled =
+      authorization === "billing_request"
+        ? await settleComputeRateSegments(tx, {
+            organizationId,
+            workloadKind: "container",
+            workloadId: containerId,
+            periodStart: container.last_billed_at ?? container.created_at,
+            periodEnd: new Date(),
+          })
+        : null;
     const creditAvailable = new Decimal(organization.credit_balance);
     if (!creditAvailable.isFinite() || !earningsAvailable.isFinite()) {
       throw new Error("CONTAINER_STOP funding source contains an invalid numeric balance");
     }
-    if (creditAvailable.plus(earningsAvailable).gte(settled.amount)) {
+    if (settled && creditAvailable.plus(earningsAvailable).gte(settled.amount)) {
       const fundedAt = new Date();
       await tx
         .update(containerComputeStopIntents)
@@ -270,6 +281,8 @@ export async function dispatchContainerStopJob(job: {
         .where(eq(containerComputeStopIntents.id, intentId));
       return { outcome: { stopped: true }, releaseNodeId: provider.nodeId };
     } catch (error) {
+      // error-policy:J1 the daemon boundary persists a typed retry state and
+      // rethrows after the transaction commits that recovery evidence.
       const message = error instanceof Error ? error.message : String(error);
       const failedAt = new Date();
       await tx
@@ -334,6 +347,7 @@ export async function enqueueContainerStopOnce(p: {
   containerId: string;
   organizationId: string;
   userId?: string;
+  authorization?: ContainerStopAuthorization;
 }): Promise<
   | { requested: true; id: string; created: boolean }
   | { requested: false; id: null; created: false; reason: "funding_restored" }
@@ -359,12 +373,40 @@ export async function enqueueContainerStopOnce(p: {
       .limit(1);
     if (!container) throw new Error("Container stop target not found in tenant");
     const now = new Date();
+    const authorization = p.authorization ?? "billing_request";
+    const isBillingEligible =
+      container.status === "running" &&
+      container.billing_status === "shutdown_pending" &&
+      container.scheduled_shutdown_at !== null &&
+      container.scheduled_shutdown_at <= now;
+    const isUserEligible =
+      container.status === "running" &&
+      ["active", "warning", "shutdown_pending"].includes(container.billing_status);
     if (
-      container.status !== "running" ||
-      container.billing_status !== "shutdown_pending" ||
-      !container.scheduled_shutdown_at ||
-      container.scheduled_shutdown_at > now
+      (authorization === "billing_request" && !isBillingEligible) ||
+      (authorization === "user_request" && !isUserEligible)
     ) {
+      const [confirmed] = await tx
+        .select({ job_id: containerComputeStopIntents.job_id })
+        .from(containerComputeStopIntents)
+        .where(
+          and(
+            eq(containerComputeStopIntents.organization_id, p.organizationId),
+            eq(containerComputeStopIntents.container_id, p.containerId),
+            eq(containerComputeStopIntents.lifecycle_revision, container.lifecycle_revision),
+            eq(containerComputeStopIntents.status, "provider_confirmed"),
+          ),
+        )
+        .orderBy(desc(containerComputeStopIntents.updated_at))
+        .limit(1);
+      if (
+        authorization === "user_request" &&
+        container.status === "stopped" &&
+        container.billing_status === "suspended" &&
+        confirmed?.job_id
+      ) {
+        return { requested: true, id: confirmed.job_id, created: false };
+      }
       throw new Error("Container is not eligible for a billing stop intent");
     }
     const [organization] = await tx
@@ -379,7 +421,7 @@ export async function enqueueContainerStopOnce(p: {
     if (!organization) throw new Error("Container billing organization not found");
 
     let earningsAvailable = new Decimal(0);
-    if (organization.pay_as_you_go_from_earnings) {
+    if (authorization === "billing_request" && organization.pay_as_you_go_from_earnings) {
       const [sourceUser] = await tx
         .select({ id: users.id })
         .from(users)
@@ -400,18 +442,21 @@ export async function enqueueContainerStopOnce(p: {
       }
     }
     const periodStart = container.last_billed_at ?? container.created_at;
-    const settled = await settleComputeRateSegments(tx, {
-      organizationId: p.organizationId,
-      workloadKind: "container",
-      workloadId: p.containerId,
-      periodStart,
-      periodEnd: now,
-    });
+    const settled =
+      authorization === "billing_request"
+        ? await settleComputeRateSegments(tx, {
+            organizationId: p.organizationId,
+            workloadKind: "container",
+            workloadId: p.containerId,
+            periodStart,
+            periodEnd: now,
+          })
+        : null;
     const creditAvailable = new Decimal(organization.credit_balance);
     if (!creditAvailable.isFinite() || !earningsAvailable.isFinite()) {
       throw new Error("Container stop funding source contains an invalid numeric balance");
     }
-    if (creditAvailable.plus(earningsAvailable).gte(settled.amount)) {
+    if (settled && creditAvailable.plus(earningsAvailable).gte(settled.amount)) {
       await tx
         .update(containerComputeStopIntents)
         .set({ status: "superseded", superseded_at: now, updated_at: now })
@@ -459,7 +504,38 @@ export async function enqueueContainerStopOnce(p: {
       .for("update")
       .limit(1);
     if (existingIntent?.job_id) {
+      if (authorization === "user_request") {
+        const [existingJob] = await tx
+          .select({ data: jobs.data })
+          .from(jobs)
+          .where(eq(jobs.id, existingIntent.job_id))
+          .for("update")
+          .limit(1);
+        if (existingJob) {
+          await tx
+            .update(jobs)
+            .set({
+              data: { ...(existingJob.data ?? {}), authorization: "user_request" },
+              updated_at: now,
+            })
+            .where(eq(jobs.id, existingIntent.job_id));
+        }
+      }
       return { requested: true, id: existingIntent.job_id, created: false };
+    }
+
+    if (authorization === "user_request") {
+      await tx
+        .update(containers)
+        .set({
+          billing_status: "shutdown_pending",
+          scheduled_shutdown_at: now,
+          shutdown_warning_sent_at: null,
+          updated_at: now,
+        })
+        .where(
+          and(eq(containers.id, p.containerId), eq(containers.organization_id, p.organizationId)),
+        );
     }
 
     const [intent] = existingIntent
@@ -486,6 +562,7 @@ export async function enqueueContainerStopOnce(p: {
           organizationId: p.organizationId,
           intentId: intent.id,
           lifecycleRevision: intent.lifecycle_revision,
+          authorization,
         },
       })
       .returning({ id: jobs.id });

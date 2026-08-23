@@ -2147,6 +2147,8 @@ export class ProvisioningJobService {
     organizationId: string;
     userId: string;
     authorization: "user_request" | "billing_request";
+    expectedLifecycleRevision?: number;
+    requireUserOwnedBillingAuthority?: boolean;
     webhookUrl?: string;
   }): Promise<EnqueueAgentSuspendResult> {
     return this.enqueueLifecycleJob<AgentSuspendJobData>({
@@ -2165,6 +2167,33 @@ export class ProvisioningJobService {
       maxAttempts: 3,
       estimatedDurationMs: 30_000,
       logName: "agent_suspend",
+      validateSandbox: (sandbox) => {
+        if (
+          params.expectedLifecycleRevision !== undefined &&
+          sandbox.lifecycle_revision !== params.expectedLifecycleRevision
+        ) {
+          throw new ApiError(
+            409,
+            "session_not_ready",
+            "Managed agent lifecycle changed before cancellation enqueue",
+          );
+        }
+        if (
+          params.requireUserOwnedBillingAuthority &&
+          (!isContainerBackedExecutionTier(sandbox.execution_tier) ||
+            sandbox.pool_status !== null ||
+            sandbox.deletion_attempt_id !== null ||
+            sandbox.deleted_at !== null)
+        ) {
+          throw new ApiError(
+            409,
+            "session_not_ready",
+            sandbox.deletion_attempt_id || sandbox.deleted_at
+              ? "Managed agent deletion is in progress"
+              : "Managed agent billing authority changed",
+          );
+        }
+      },
       idempotencyPredicates:
         params.authorization === "user_request"
           ? [sql`${jobs.data}->>'authorization' = 'user_request'`]

@@ -1,6 +1,6 @@
 /**
- * Verifies configured platform-MCP forwarding cannot bypass final billing
- * cancellation authority, including requests embedded in JSON-RPC batches.
+ * Verifies configured platform-MCP forwarding positively classifies protocol
+ * envelopes and gates every tool invocation before the real forwarding seam.
  */
 
 import { beforeEach, describe, expect, mock, test } from "bun:test";
@@ -174,6 +174,61 @@ describe("configured platform MCP billing cancellation authority", () => {
 
     expect(requireCurrentBillingManagerSession).not.toHaveBeenCalled();
     expect(forwardMcpUpstreamRequest).toHaveBeenCalledTimes(1);
+  });
+
+  test("gates unknown, versioned, and alternate-shape tool vocabulary", async () => {
+    requireCurrentBillingManagerSession.mockRejectedValue(
+      Object.assign(new Error("A signed-in user session is required"), {
+        status: 401,
+      }),
+    );
+
+    for (const request of [
+      {
+        jsonrpc: "2.0",
+        id: "renamed",
+        method: "tools/call",
+        params: {
+          name: "vendor.billing.stop.v9",
+          arguments: { target: "r-1" },
+        },
+      },
+      {
+        jsonrpc: "2.0",
+        id: "encoded",
+        method: "tools/call",
+        params: { name: "anything", payload: "%252Fbilling%252Fcancel" },
+      },
+      {
+        jsonrpc: "2.0",
+        id: "empty-args",
+        method: "tools/call",
+        params: { name: "read-looking-tool" },
+      },
+    ]) {
+      const response = await post(request);
+      expect(response.status).toBe(200);
+    }
+
+    expect(requireCurrentBillingManagerSession).toHaveBeenCalledTimes(3);
+    expect(forwardMcpUpstreamRequest).not.toHaveBeenCalled();
+  });
+
+  test("rejects unknown protocol methods instead of forwarding by default", async () => {
+    const response = await post({
+      jsonrpc: "2.0",
+      id: "future-mutation",
+      method: "vendor/mutate",
+      params: { operation: "cancel" },
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      id: "future-mutation",
+      error: { code: -32601 },
+    });
+    expect(requireCurrentBillingManagerSession).not.toHaveBeenCalled();
+    expect(forwardMcpUpstreamRequest).not.toHaveBeenCalled();
   });
 
   test("fails closed without forwarding malformed upstream JSON", async () => {
