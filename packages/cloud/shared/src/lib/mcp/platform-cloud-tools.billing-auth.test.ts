@@ -1,6 +1,6 @@
 /**
- * Verifies MCP billable-resource cancellation cannot reach the service unless
- * the final current-session OWNER/ADMIN authority gate succeeds.
+ * Verifies MCP billing tools advertise and enforce capability-specific access,
+ * including a final current-session authority check before cancellation.
  */
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
@@ -33,6 +33,14 @@ mock.module("../../db/repositories", () => ({
 mock.module("../cloud-capabilities", () => ({
   executeCloudCapabilityRest: mock(),
   getCloudCapabilities: () => [
+    {
+      summary: "List active resources.",
+      auth: { modes: ["session", "api_key"] },
+      surfaces: {
+        rest: { method: "GET", path: "/api/v1/billing/resources" },
+        mcp: { tool: "cloud.billing.active_resources" },
+      },
+    },
     {
       summary: "Stop future billing.",
       auth: { modes: ["session"], organizationRoles: ["owner", "admin"] },
