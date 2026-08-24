@@ -199,11 +199,14 @@ async function authorizeConfiguredUpstreamMessages(
   if (tools.length === 0) return null;
 
   try {
-    if (tools.some((entry) => entry.authority === "admin")) {
+    const authorities = new Set(tools.map((entry) => entry.authority));
+    if (authorities.has("admin")) {
       await requireAdmin(c);
-    } else if (tools.some((entry) => entry.authority === "billing_manager")) {
+    }
+    if (authorities.has("billing_manager")) {
       await requireCurrentBillingManagerSession(c);
-    } else {
+    }
+    if (authorities.has("member")) {
       await requireUserOrApiKeyWithOrg(c);
     }
     return null;

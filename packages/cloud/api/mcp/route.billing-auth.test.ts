@@ -291,6 +291,58 @@ describe("configured platform MCP billing cancellation authority", () => {
     expect(forwardMcpUpstreamRequest).toHaveBeenCalledTimes(1);
   });
 
+  test("requires every distinct authority represented in a mixed batch", async () => {
+    requireAdmin.mockResolvedValue({
+      user: { id: "admin-1" },
+      role: "super_admin",
+    });
+    requireCurrentBillingManagerSession.mockRejectedValue(
+      Object.assign(
+        new Error("A current billing-manager session is required"),
+        {
+          status: 401,
+        },
+      ),
+    );
+
+    const response = await post([
+      {
+        jsonrpc: "2.0",
+        id: "admin",
+        method: "tools/call",
+        params: {
+          name: "cloud.admin.request",
+          arguments: { method: "POST", path: "/api/admin/test" },
+        },
+      },
+      {
+        jsonrpc: "2.0",
+        id: "billing",
+        method: "tools/call",
+        params: {
+          name: "cloud.billing.cancel_resource",
+          arguments: { resourceId: "r-1" },
+        },
+      },
+    ]);
+
+    expect(response.status).toBe(200);
+    expect(requireAdmin).toHaveBeenCalledTimes(1);
+    expect(requireCurrentBillingManagerSession).toHaveBeenCalledTimes(1);
+    expect(requireUserOrApiKeyWithOrg).not.toHaveBeenCalled();
+    expect(await response.json()).toEqual([
+      expect.objectContaining({
+        id: "admin",
+        error: expect.objectContaining({ code: -32000 }),
+      }),
+      expect.objectContaining({
+        id: "billing",
+        error: expect.objectContaining({ code: -32000 }),
+      }),
+    ]);
+    expect(forwardMcpUpstreamRequest).not.toHaveBeenCalled();
+  });
+
   test("denies unknown, versioned, and alternate-shape tool vocabulary", async () => {
     for (const request of [
       {
