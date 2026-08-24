@@ -184,6 +184,47 @@ async function waitForApplicationBlockingRelations(
   );
 }
 
+interface DirectTransactionBlockRow {
+  waiting_transaction_id: string;
+  blocker_transaction_id: string;
+}
+
+async function waitForDirectTransactionIdBlock(
+  observer: Client,
+  waiterApplicationName: string,
+  blockerApplicationName: string,
+): Promise<void> {
+  const deadline = Date.now() + 8_000;
+  let lastRows: DirectTransactionBlockRow[] = [];
+  while (Date.now() < deadline) {
+    const result = await observer.query<DirectTransactionBlockRow>(
+      `SELECT waiting.transactionid::text AS waiting_transaction_id,
+              blocker.backend_xid::text AS blocker_transaction_id
+       FROM pg_stat_activity AS waiter
+       JOIN pg_locks AS waiting
+         ON waiting.pid = waiter.pid
+        AND NOT waiting.granted
+       JOIN pg_stat_activity AS blocker
+         ON blocker.datid = waiter.datid
+        AND blocker.application_name = $2
+       WHERE waiter.datname = current_database()
+         AND waiter.application_name = $1
+         AND waiter.wait_event_type = 'Lock'
+         AND waiter.wait_event = 'transactionid'
+         AND waiting.locktype = 'transactionid'
+         AND waiting.mode = 'ShareLock'
+         AND waiting.transactionid = blocker.backend_xid`,
+      [waiterApplicationName, blockerApplicationName],
+    );
+    lastRows = result.rows;
+    if (lastRows.length > 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(
+    `Timed out observing a direct PostgreSQL transaction-ID block: ${JSON.stringify({ waiterApplicationName, blockerApplicationName, lastRows })}`,
+  );
+}
+
 async function grantedRelationWriteLocks(
   observer: Client,
   applicationName: string,
@@ -206,6 +247,31 @@ async function grantedRelationWriteLocks(
          'ExclusiveLock',
          'AccessExclusiveLock'
        )`,
+    [applicationName, relationName],
+  );
+  return result.rows;
+}
+
+interface ApplicationTargetLock {
+  locktype: string;
+  mode: string;
+  granted: boolean;
+}
+
+async function applicationLocksTargetingRelation(
+  observer: Client,
+  applicationName: string,
+  relationName: string,
+): Promise<ApplicationTargetLock[]> {
+  const result = await observer.query<ApplicationTargetLock>(
+    `SELECT target_lock.locktype, target_lock.mode, target_lock.granted
+     FROM pg_stat_activity AS activity
+     JOIN pg_locks AS target_lock ON target_lock.pid = activity.pid
+     WHERE activity.datname = current_database()
+       AND activity.application_name = $1
+       AND target_lock.database = activity.datid
+       AND target_lock.relation = to_regclass($2)
+     ORDER BY target_lock.locktype, target_lock.mode, target_lock.granted`,
     [applicationName, relationName],
   );
   return result.rows;
@@ -962,9 +1028,10 @@ realPostgres("cloud lifecycle lock proofs", () => {
     const attemptHolderApplicationName = `s1-attempt-holder-${tag}`;
     const cleanupApplicationName = `s1-cleanup-${tag}`;
     const nextStartApplicationName = `s1-next-start-${tag}`;
-    const [holder, observer] = await connectNamedClients(isolatedDsn, [
+    const [holder, observer, sandboxProbe] = await connectNamedClients(isolatedDsn, [
       attemptHolderApplicationName,
       `s1-observer-${tag}`,
+      `s1-sandbox-probe-${tag}`,
     ]);
     let cleanupPromise: Promise<unknown> | undefined;
     let nextStartPromise: Promise<unknown> | undefined;
@@ -985,12 +1052,28 @@ realPostgres("cloud lifecycle lock proofs", () => {
           "d".repeat(64),
         ),
       );
-      await waitForApplicationBlockingRelations(observer, [
-        {
-          waiterApplicationName: cleanupApplicationName,
-          blockerApplicationName: attemptHolderApplicationName,
-        },
-      ]);
+      await waitForDirectTransactionIdBlock(
+        observer,
+        cleanupApplicationName,
+        attemptHolderApplicationName,
+      );
+
+      await sandboxProbe.query("BEGIN");
+      let sandboxNowaitError: unknown;
+      try {
+        await sandboxProbe.query(
+          `SELECT id FROM agent_sandboxes
+           WHERE id = $1 AND organization_id = $2
+           FOR KEY SHARE NOWAIT`,
+          [fixture.agentId, fixture.organizationId],
+        );
+      } catch (error) {
+        // error-policy:J1 The test boundary retains PostgreSQL's exact NOWAIT code.
+        sandboxNowaitError = error;
+      } finally {
+        await rollbackQuietly(sandboxProbe);
+      }
+      expect(sandboxNowaitError).toMatchObject({ code: "55P03" });
 
       const nextStartInput = { ...fixture.startInput, attemptId: randomUUID() };
       nextStartPromise = inNamedTransaction(nextStartApplicationName, (tx) =>
@@ -999,16 +1082,28 @@ realPostgres("cloud lifecycle lock proofs", () => {
           nextStartInput,
         ),
       );
-      await waitForApplicationBlockingRelations(observer, [
-        {
-          waiterApplicationName: cleanupApplicationName,
-          blockerApplicationName: attemptHolderApplicationName,
-        },
-        {
-          waiterApplicationName: nextStartApplicationName,
-          blockerApplicationName: cleanupApplicationName,
-        },
-      ]);
+      await waitForDirectTransactionIdBlock(
+        observer,
+        nextStartApplicationName,
+        cleanupApplicationName,
+      );
+      // pg_blocking_pids() may report cleanup as a soft blocker ahead in the
+      // attempt-row queue. The direct XID wait above plus this complete relation
+      // footprint rules out that attempt-first counterexample.
+      expect(
+        await applicationLocksTargetingRelation(
+          observer,
+          nextStartApplicationName,
+          "agent_sandbox_replacement_attempts",
+        ),
+      ).toEqual([]);
+      expect(
+        await applicationLocksTargetingRelation(
+          observer,
+          nextStartApplicationName,
+          "agent_sandboxes",
+        ),
+      ).toContainEqual({ locktype: "relation", mode: "RowShareLock", granted: true });
 
       await holder.query("COMMIT");
       const [cleanupResult, nextStartResult] = await Promise.allSettled([
@@ -1048,7 +1143,7 @@ realPostgres("cloud lifecycle lock proofs", () => {
           (promise): promise is Promise<unknown> => promise !== undefined,
         ),
       );
-      await Promise.all([endQuietly(holder), endQuietly(observer)]);
+      await Promise.all([endQuietly(holder), endQuietly(observer), endQuietly(sandboxProbe)]);
     }
   }, 30_000);
 
