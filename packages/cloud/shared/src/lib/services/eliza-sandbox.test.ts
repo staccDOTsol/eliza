@@ -1832,6 +1832,88 @@ describe("ElizaSandboxService shutdown fails closed without a current capture (#
       lockedRead.mockRestore();
     }
   });
+
+  test("a capture from generation A cannot be persisted onto or stop generation B that reuses its bridge URL", async () => {
+    const { ElizaSandboxService } = await import("./eliza-sandbox.ts?actual");
+    const captured: AgentSandbox = {
+      ...customSandbox(),
+      lifecycle_revision: 41,
+      environment_revision: 7,
+    };
+    const replacement: AgentSandbox = {
+      ...captured,
+      // Deliberately retain the bridge URL: this is the ABA shape the former
+      // URL-only correlation admitted after the remote snapshot returned.
+      sandbox_id: "sandbox-generation-b",
+      node_id: "node-generation-b",
+      container_name: "agent-generation-b",
+      environment_revision: 8,
+      lifecycle_revision: 42,
+    };
+    const provider: SandboxProvider = {
+      create: mock(async () => {
+        throw new Error("must not create");
+      }),
+      stopForDeletion: mock(async () => ({ kind: "not-running-proven" as const })),
+      stopForReplacement: mock(async () => {}),
+      checkHealth: mock(async () => true),
+    };
+    type ShutdownGenerationService = {
+      shutdown(agentId: string, orgId: string): Promise<{ success: boolean; error?: string }>;
+      getAgentForWrite(agentId: string, orgId: string): Promise<AgentSandbox | undefined>;
+      fetchSnapshotState(rec: AgentSandbox): Promise<{
+        stateData: { memories: unknown[]; config: Record<string, unknown>; workspaceFiles: object };
+        sizeBytes: number;
+        bridgeUrl: string;
+      }>;
+      lockLifecycle(tx: unknown, agentId: string, orgId: string): Promise<void>;
+      getAgentForLifecycleMutation(
+        tx: unknown,
+        agentId: string,
+        orgId: string,
+      ): Promise<AgentSandbox | undefined>;
+      persistSnapshotWithinTransaction(...args: unknown[]): Promise<unknown>;
+    };
+    const service = new ElizaSandboxService(provider) as unknown as ShutdownGenerationService;
+    const primaryRead = spyOn(service, "getAgentForWrite").mockResolvedValue(captured);
+    const fetchSnapshot = spyOn(service, "fetchSnapshotState").mockResolvedValue({
+      stateData: { memories: [], config: {}, workspaceFiles: {} },
+      sizeBytes: 2,
+      bridgeUrl: captured.bridge_url!,
+    });
+    const lockLifecycle = spyOn(service, "lockLifecycle").mockResolvedValue(undefined);
+    const lockedRead = spyOn(service, "getAgentForLifecycleMutation").mockResolvedValue(
+      replacement,
+    );
+    const persistSnapshot = spyOn(service, "persistSnapshotWithinTransaction");
+    const writes: unknown[] = [];
+    upgradeTransactionImpl = async (fn) =>
+      fn({
+        execute: async (query) => {
+          writes.push(query);
+          return { rows: [] };
+        },
+      });
+
+    try {
+      await expect(service.shutdown(captured.id, captured.organization_id)).resolves.toEqual({
+        success: false,
+        error:
+          "Refusing to stop: the agent's lifecycle generation moved after the pre-stop capture; retry the shutdown.",
+      });
+      expect(fetchSnapshot).toHaveBeenCalledWith(captured);
+      expect(persistSnapshot).not.toHaveBeenCalled();
+      expect(provider.stopForReplacement).not.toHaveBeenCalled();
+      expect(writes).toHaveLength(0);
+    } finally {
+      upgradeTransactionImpl = null;
+      primaryRead.mockRestore();
+      fetchSnapshot.mockRestore();
+      lockLifecycle.mockRestore();
+      lockedRead.mockRestore();
+      persistSnapshot.mockRestore();
+    }
+  });
 });
 
 describe("ElizaSandboxService shutdown state-loss-acknowledged override (#18228)", () => {
@@ -2492,7 +2574,7 @@ describe("ElizaSandboxService recoverDisconnected", () => {
       );
       expect(result).toBe("recovered");
       expect(casSpy).toHaveBeenCalledTimes(1);
-      expect(casSpy.mock.calls[0]?.[0]).toBe(sandbox.id);
+      expect(casSpy.mock.calls[0]).toEqual([sandbox]);
     } finally {
       findSpy.mockRestore();
       casSpy.mockRestore();
@@ -2523,7 +2605,7 @@ describe("ElizaSandboxService recoverDisconnected", () => {
       );
       expect(result).toBe("recovered");
       expect(casSpy).toHaveBeenCalledTimes(1);
-      expect(casSpy.mock.calls[0]).toEqual([sandbox.id, "error"]);
+      expect(casSpy.mock.calls[0]).toEqual([sandbox]);
     } finally {
       findSpy.mockRestore();
       casSpy.mockRestore();
@@ -3414,12 +3496,17 @@ describe("ElizaSandboxService tailnet-IP reconciliation", () => {
       );
       expect(result).toBe("recovered");
       expect(casSpy).toHaveBeenCalledTimes(1);
-      expect(casSpy.mock.calls[0]).toEqual([sandbox.id, "disconnected"]);
-      expect(updateSpy).toHaveBeenCalledTimes(1);
-      const [id, patch] = updateSpy.mock.calls[0] as [string, Record<string, unknown>];
-      expect(id).toBe(sandbox.id);
-      expect(patch.headscale_ip).toBe(NEW_IP);
-      expect(patch.bridge_url).toBe(REPAIRED_BRIDGE);
+      expect(casSpy.mock.calls[0]).toEqual([
+        sandbox,
+        {
+          headscaleIp: NEW_IP,
+          bridgeUrl: REPAIRED_BRIDGE,
+          errorCount: 0,
+        },
+      ]);
+      // Repaired ingress is part of the same generation CAS. A second generic
+      // update could otherwise write A's URL/IP onto a stopped or replaced B.
+      expect(updateSpy).not.toHaveBeenCalled();
     } finally {
       findSpy.mockRestore();
       casSpy.mockRestore();

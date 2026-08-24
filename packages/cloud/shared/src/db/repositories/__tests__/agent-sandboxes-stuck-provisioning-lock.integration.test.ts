@@ -125,6 +125,15 @@ async function waitForAgentSandboxRowLockWaiters(observer: Client, minimum: numb
   throw new Error(`Timed out waiting for ${minimum} agent_sandboxes row-lock waiter(s)`);
 }
 
+async function currentSandboxCapture(agentId: string) {
+  if (!agentSandboxesRepository) {
+    throw new Error("agent sandbox repository was not initialized");
+  }
+  const row = await agentSandboxesRepository.findById(agentId);
+  if (!row) throw new Error(`Sandbox ${agentId} disappeared`);
+  return row;
+}
+
 if (!postgres) {
   console.warn(SKIP_REASON);
 } else {
@@ -415,6 +424,142 @@ realPostgres("stuck provisioning lifecycle lock", () => {
     }
   }, 30_000);
 
+  test("reconnect cannot outrun an enqueue whose pending job is not visible yet", async () => {
+    if (!isolatedDsn || !dbWrite || !agentSandboxesRepository || !provisioningJobService) {
+      throw new Error("real PostgreSQL harness was not initialized");
+    }
+
+    const suffix = randomUUID();
+    const identifierSuffix = suffix.replaceAll("-", "").slice(0, 12);
+    const [organization] = await dbWrite
+      .insert(organizations)
+      .values({ name: "Reconnect Enqueue Lock Org", slug: `reconnect-enqueue-lock-${suffix}` })
+      .returning();
+    const [user] = await dbWrite
+      .insert(users)
+      .values({
+        steward_user_id: `reconnect-enqueue-lock-${suffix}`,
+        organization_id: organization.id,
+      })
+      .returning();
+    const [sandbox] = await dbWrite
+      .insert(agentSandboxes)
+      .values({
+        organization_id: organization.id,
+        user_id: user.id,
+        agent_name: `reconnect-enqueue-lock-${suffix}`,
+        status: "disconnected",
+        execution_tier: "dedicated-always",
+        sandbox_id: `sandbox-${suffix}`,
+        node_id: `node-${suffix}`,
+        container_name: `container-${suffix}`,
+        bridge_url: `https://old-${identifierSuffix}.example`,
+        health_url: `https://old-${identifierSuffix}.example/api/health`,
+        headscale_ip: "100.64.0.40",
+        error_count: 3,
+      })
+      .returning();
+
+    const repairedIngress = {
+      bridgeUrl: `https://repaired-${identifierSuffix}.example`,
+      headscaleIp: "100.64.0.41",
+      errorCount: 0,
+    };
+    const gateKeyOne = `reconnect_gate_${identifierSuffix}`;
+    const gateKeyTwo = `job_insert_${identifierSuffix}`;
+    const functionName = `block_reconnect_insert_${identifierSuffix}`;
+    const triggerName = `block_reconnect_insert_trigger_${identifierSuffix}`;
+    const control = new Client({ connectionString: isolatedDsn });
+    const setup = new Client({ connectionString: isolatedDsn });
+    await Promise.all([control.connect(), setup.connect()]);
+    try {
+      await setup.query(`
+        CREATE FUNCTION ${functionName}() RETURNS trigger AS $$
+        BEGIN
+          PERFORM pg_advisory_xact_lock(hashtext(TG_ARGV[0]), hashtext(TG_ARGV[1]));
+          RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+      `);
+      await setup.query(
+        `CREATE TRIGGER ${triggerName}
+         BEFORE INSERT ON jobs
+         FOR EACH ROW
+         EXECUTE FUNCTION ${functionName}('${gateKeyOne}', '${gateKeyTwo}')`,
+      );
+
+      await control.query("BEGIN");
+      await control.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", [
+        gateKeyOne,
+        gateKeyTwo,
+      ]);
+
+      const enqueue = provisioningJobService.enqueueAgentProvisionOnce({
+        agentId: sandbox.id,
+        organizationId: organization.id,
+        userId: user.id,
+        agentName: sandbox.agent_name ?? sandbox.id,
+        expectedLifecycleRevision: sandbox.lifecycle_revision,
+      });
+      await waitForAdvisoryWaiters(control, 1);
+
+      let reconnectSettled = false;
+      const reconnect = agentSandboxesRepository
+        .markReconnectedFromDisconnected(sandbox, repairedIngress)
+        .finally(() => {
+          reconnectSettled = true;
+        });
+      const observationDeadline = Date.now() + 5_000;
+      let sawRowWaiter = false;
+      while (!reconnectSettled && !sawRowWaiter && Date.now() < observationDeadline) {
+        const waiting = await control.query<{ count: string }>(
+          `SELECT count(*)::text AS count
+           FROM pg_stat_activity
+           WHERE datname = current_database()
+             AND pid <> pg_backend_pid()
+             AND wait_event_type = 'Lock'
+             AND query ILIKE '%agent_sandboxes%'`,
+        );
+        sawRowWaiter = Number(waiting.rows[0]?.count ?? 0) >= 1;
+        if (!reconnectSettled && !sawRowWaiter) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      }
+      expect(reconnectSettled || sawRowWaiter).toBe(true);
+      await control.query("COMMIT");
+
+      const [enqueueResult, reconnected] = await Promise.all([enqueue, reconnect]);
+      expect(enqueueResult.created).toBe(true);
+      expect(reconnected).toBeUndefined();
+      expect(await currentSandboxCapture(sandbox.id)).toMatchObject({
+        status: "disconnected",
+        bridge_url: sandbox.bridge_url,
+        headscale_ip: sandbox.headscale_ip,
+        error_count: 3,
+      });
+
+      await dbWrite
+        .update(jobs)
+        .set({ status: "completed", completed_at: new Date() })
+        .where(eq(jobs.id, enqueueResult.job.id));
+      const freshCapture = await currentSandboxCapture(sandbox.id);
+      expect(
+        await agentSandboxesRepository.markReconnectedFromDisconnected(
+          freshCapture,
+          repairedIngress,
+        ),
+      ).toMatchObject({
+        status: "running",
+        bridge_url: repairedIngress.bridgeUrl,
+        headscale_ip: repairedIngress.headscaleIp,
+        error_count: 0,
+      });
+    } finally {
+      await control.query("ROLLBACK");
+      await Promise.allSettled([control.end(), setup.end()]);
+    }
+  }, 30_000);
+
   test("lock contention defers one stuck row without blocking later candidates", async () => {
     if (!isolatedDsn || !dbWrite || !agentSandboxesRepository) {
       throw new Error("real PostgreSQL harness was not initialized");
@@ -529,7 +674,7 @@ realPostgres("stuck provisioning lifecycle lock", () => {
       const orphanBatch =
         await agentSandboxesRepository.markOrphanedPendingWithoutJobAsError(SWEEP_CUTOFF);
       expect(orphanBatch.deferred).toBe(1);
-      expect(await agentSandboxesRepository.markRunningFromProvisioning(wedged.id)).toMatchObject({
+      expect(await agentSandboxesRepository.markRunningFromProvisioning(wedged)).toMatchObject({
         id: wedged.id,
         status: "running",
       });
@@ -548,12 +693,14 @@ realPostgres("stuck provisioning lifecycle lock", () => {
         organization.id,
         wedged.id,
       ]);
-      expect(await agentSandboxesRepository.markRunningFromProvisioning(wedged.id)).toBeUndefined();
+      const retryCapture = await currentSandboxCapture(wedged.id);
+      expect(
+        await agentSandboxesRepository.markRunningFromProvisioning(retryCapture),
+      ).toBeUndefined();
       await lock.query("COMMIT");
-      expect(await agentSandboxesRepository.markRunningFromProvisioning(wedged.id)).toMatchObject({
-        id: wedged.id,
-        status: "running",
-      });
+      expect(
+        await agentSandboxesRepository.markRunningFromProvisioning(retryCapture),
+      ).toMatchObject({ id: wedged.id, status: "running" });
     } finally {
       await lock.query("ROLLBACK");
       await lock.end();
@@ -596,11 +743,15 @@ realPostgres("stuck provisioning lifecycle lock", () => {
       await control.query("BEGIN");
       await control.query("SELECT id FROM agent_sandboxes WHERE id = $1 FOR UPDATE", [sandbox.id]);
 
-      // The repository's unlocked candidate read sees the canonical tier, then
-      // its final UPDATE blocks on this session's row lock. Flip to Shared in
-      // the lock-owning session before releasing it: the tier-qualified final
-      // CAS must observe the committed change and affect zero rows.
-      const recovery = agentSandboxesRepository.markRunningFromProvisioning(sandbox.id);
+      // The exact canonical capture is submitted while this session owns the
+      // row lock, so its final UPDATE blocks. Flip to Shared before releasing
+      // the row: the tier-qualified final CAS must observe the committed change
+      // and affect zero rows.
+      const recovery = agentSandboxesRepository.markRunningFromProvisioning(sandbox);
+      // Let the pooled transaction submit its UPDATE before the independent
+      // observer begins polling pg_stat_activity. Without this yield Bun can
+      // repeatedly schedule the observer connection ahead of the new query.
+      await new Promise((resolve) => setTimeout(resolve, 100));
       await waitForAgentSandboxRowLockWaiters(control, 1);
       await control.query("UPDATE agent_sandboxes SET execution_tier = 'shared' WHERE id = $1", [
         sandbox.id,

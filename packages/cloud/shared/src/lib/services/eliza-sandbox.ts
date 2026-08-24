@@ -632,7 +632,13 @@ function snapshotCaptureStillCanonical(
   captured: SnapshotAuthorityCapture,
 ): boolean {
   return (
+    current.id === captured.id &&
+    current.organization_id === captured.organization_id &&
+    current.status === captured.status &&
     current.execution_tier === captured.execution_tier &&
+    current.pool_status === captured.pool_status &&
+    (current.deleted_at?.getTime() ?? null) === (captured.deleted_at?.getTime() ?? null) &&
+    current.deletion_attempt_id === captured.deletion_attempt_id &&
     current.sandbox_id === captured.sandbox_id &&
     current.node_id === captured.node_id &&
     current.container_name === captured.container_name &&
@@ -8663,7 +8669,7 @@ export class ElizaSandboxService {
     agentId: string,
     orgId: string,
   ): Promise<"recovered" | "unreachable" | "gone"> {
-    let rec = await this.getAgentForWrite(agentId, orgId);
+    const rec = await this.getAgentForWrite(agentId, orgId);
     if (
       !rec ||
       !isContainerBackedExecutionTier(rec.execution_tier) ||
@@ -8671,7 +8677,6 @@ export class ElizaSandboxService {
     ) {
       return "gone";
     }
-    const recoverableStatus = rec.status;
     const reachable = await this.probeBridgeHealth(rec);
     if (!reachable) {
       // The stored bridge_url may simply be stale (container restart → new
@@ -8685,16 +8690,12 @@ export class ElizaSandboxService {
       // Same guarded CAS as the plain recovery flip below: only revive a row
       // that is STILL in the probed recoverable status, then persist the
       // repaired ingress columns on the now-running row.
-      const revived = await agentSandboxesRepository.markReconnectedFromDisconnected(
-        rec.id,
-        recoverableStatus,
-      );
-      if (!revived) return "gone";
-      await agentSandboxesRepository.update(rec.id, {
-        headscale_ip: reconcile.headscaleIp,
-        bridge_url: reconcile.bridgeUrl,
-        error_count: 0,
+      const revived = await agentSandboxesRepository.markReconnectedFromDisconnected(rec, {
+        headscaleIp: reconcile.headscaleIp,
+        bridgeUrl: reconcile.bridgeUrl,
+        errorCount: 0,
       });
+      if (!revived) return "gone";
       logger.info(
         `[agent-sandbox] Reconciled stale tailnet IP ${rec.headscale_ip}→${reconcile.headscaleIp} for agent ${agentId}`,
       );
@@ -8704,10 +8705,7 @@ export class ElizaSandboxService {
     // bridge_url) / provisioning during the multi-second probe. Only flip it if
     // it is STILL disconnected with a live bridge — otherwise we'd resurrect a
     // being-deleted agent or wedge a stopped one at `running` with a dead bridge.
-    const restored = await agentSandboxesRepository.markReconnectedFromDisconnected(
-      rec.id,
-      recoverableStatus,
-    );
+    const restored = await agentSandboxesRepository.markReconnectedFromDisconnected(rec);
     if (!restored) return "gone";
     logger.info("[agent-sandbox] Recovered agent back to running", {
       agentId,
@@ -8799,7 +8797,7 @@ export class ElizaSandboxService {
 
     // Guarded CAS: only flip if still `provisioning` with a live container and
     // no active provision job racing it (see markRunningFromProvisioning).
-    const flipped = await agentSandboxesRepository.markRunningFromProvisioning(rec.id);
+    const flipped = await agentSandboxesRepository.markRunningFromProvisioning(rec);
     if (!flipped) return "gone";
     logger.info(
       "[agent-sandbox] Reconciled wedged provisioning row to running (container re-probed healthy)",
@@ -8837,6 +8835,11 @@ export class ElizaSandboxService {
       sizeBytes: number;
       bridgeUrl: string;
     } | null = null;
+    // Exact authority for every remote capture attempt, including the two
+    // explicit no-capture outcomes (unsupported image and operator waiver).
+    // A response from generation A must never authorize persisting or stopping
+    // a replacement generation B that happens to reuse the same bridge URL.
+    let shutdownCaptureAuthority: SnapshotAuthorityCapture | null = null;
 
     const snapshotSource = await this.getAgentForWrite(agentId, orgId);
     if (snapshotSource) {
@@ -8844,6 +8847,7 @@ export class ElizaSandboxService {
       if (tierRejection) return { success: false, error: tierRejection };
     }
     if (snapshotSource?.status === "running" && snapshotSource.bridge_url) {
+      shutdownCaptureAuthority = snapshotSource;
       try {
         preShutdownSnapshot = await this.fetchSnapshotState(snapshotSource);
       } catch (error) {
@@ -8915,6 +8919,17 @@ export class ElizaSandboxService {
         return { success: false, error: "Agent replacement cleanup is still pending" } as const;
       }
 
+      if (
+        shutdownCaptureAuthority &&
+        !snapshotCaptureStillCanonical(rec, shutdownCaptureAuthority)
+      ) {
+        return {
+          success: false,
+          error:
+            "Refusing to stop: the agent's lifecycle generation moved after the pre-stop capture; retry the shutdown.",
+        } as const;
+      }
+
       const hasActiveProvisionJob = await this.hasActiveProvisionJobTx(tx, agentId, orgId);
       const recoveringWarmCredentialFence =
         rec.status === "provisioning" &&
@@ -8951,11 +8966,9 @@ export class ElizaSandboxService {
         !captureUnsupported &&
         !captureWaivedByOperator
       ) {
-        // The capture must be OF THIS generation. A capture taken against a
-        // different bridge_url (the row moved between the unlocked fetch and
-        // this locked read) is some other container's state; persisting it
-        // would masquerade as current, and stopping without persisting would
-        // silently discard the delta. Both refuse.
+        // The exact capture authority was checked above. Keep the returned URL
+        // assertion as an additional response-integrity check: a helper must
+        // never return bytes attributed to a different bridge than it dialled.
         if (!preShutdownSnapshot || rec.bridge_url !== preShutdownSnapshot.bridgeUrl) {
           return {
             success: false,
