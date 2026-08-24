@@ -865,12 +865,18 @@ type LifecycleTx = Parameters<Parameters<Database["transaction"]>[0]>[0];
 /** Columns the tailnet-IP reconcile path reads to locate and repair an agent. */
 type ReconcilableSandbox = Pick<
   AgentSandbox,
-  "id" | "node_id" | "container_name" | "environment_vars" | "bridge_url" | "headscale_ip"
+  | "id"
+  | "node_id"
+  | "container_name"
+  | "environment_vars"
+  | "bridge_url"
+  | "health_url"
+  | "headscale_ip"
 >;
 
 /** Outcome of a stale-tailnet-IP reconcile attempt (see reconcileStaleTailnetIp). */
 type TailnetIpReconcileResult =
-  | { outcome: "repaired"; headscaleIp: string; bridgeUrl: string }
+  | { outcome: "repaired"; headscaleIp: string; bridgeUrl: string; healthUrl: string }
   | { outcome: "container-dead" }
   | { outcome: "ip-unresolvable" }
   | { outcome: "unrepairable" };
@@ -8114,6 +8120,7 @@ export class ElizaSandboxService {
         const updated = await this.updateObservedRunningGeneration(rec, {
           headscale_ip: reconcile.headscaleIp,
           bridge_url: reconcile.bridgeUrl,
+          health_url: reconcile.healthUrl,
           last_heartbeat_at: new Date(),
           error_count: 0,
         });
@@ -8437,13 +8444,13 @@ export class ElizaSandboxService {
    * Attempt to reconcile a bridge-probe miss as a stale stored tailnet IP.
    * Containers do not persist tailscale node state, so a restart mints a fresh
    * node key and headscale assigns the next IP — leaving headscale_ip /
-   * bridge_url pointing at a dead address that EVERY consumer reads (the
+   * bridge_url / health_url pointing at a dead address that EVERY consumer reads (the
    * heartbeat probe, the agent-router's subdomain resolution, and therefore
    * the public dedicated-agent proxy). Repairing the columns heals them all;
    * anything unrepairable falls back to the existing disconnect → reprovision
-   * self-heal. The repaired bridge_url keeps the stored scheme/port and swaps
-   * only the host — the same `http://<tailnetIp>:<containerPort>` shape the
-   * provisioner writes.
+   * self-heal. A repair is admitted only for the provider's canonical tailnet
+   * pair (same old IP and internal HTTP port); it swaps the host while retaining
+   * the health path and moves every trusted ingress column to one generation.
    */
   private async reconcileStaleTailnetIp(
     rec: ReconcilableSandbox,
@@ -8453,17 +8460,44 @@ export class ElizaSandboxService {
     if (!currentIp) return { outcome: "ip-unresolvable" };
     // Same IP as stored = nothing to repair: the miss is genuine
     // unreachability at the correct address, so the dead-agent path applies.
-    if (!rec.bridge_url || currentIp === rec.headscale_ip) return { outcome: "unrepairable" };
+    if (
+      !rec.bridge_url ||
+      !rec.health_url ||
+      !rec.headscale_ip ||
+      isIP(rec.headscale_ip) !== 4 ||
+      currentIp === rec.headscale_ip
+    ) {
+      return { outcome: "unrepairable" };
+    }
 
     let bridgeUrl: string;
+    let healthUrl: string;
     try {
-      const repaired = new URL(rec.bridge_url);
-      repaired.hostname = currentIp;
-      bridgeUrl = repaired.origin;
+      const repairedBridge = new URL(rec.bridge_url);
+      const repairedHealth = new URL(rec.health_url);
+      // Bind the repair to the exact old tailnet generation. A non-tailnet
+      // Docker row stores the node hostname plus host-published ports; swapping
+      // only that hostname to a tailnet IP would manufacture unreachable URLs.
+      // Canonical headscale handles use one internal HTTP port for both ingress
+      // URLs, so reject mixed/corrupt generations and let reprovision rebuild
+      // the pair from provider metadata.
+      if (
+        repairedBridge.protocol !== "http:" ||
+        repairedHealth.protocol !== "http:" ||
+        repairedBridge.hostname !== rec.headscale_ip ||
+        repairedHealth.hostname !== rec.headscale_ip ||
+        repairedBridge.port !== repairedHealth.port
+      ) {
+        return { outcome: "unrepairable" };
+      }
+      repairedBridge.hostname = currentIp;
+      bridgeUrl = repairedBridge.origin;
+      repairedHealth.hostname = currentIp;
+      healthUrl = repairedHealth.toString();
     } catch (error) {
-      // error-policy:J4 a malformed stored bridge_url cannot be repaired in
-      // place; degrade to the existing disconnect → reprovision self-heal.
-      logger.warn("[agent-sandbox] Stored bridge_url unparsable during reconcile", {
+      // error-policy:J4 malformed stored ingress cannot be repaired in place;
+      // degrade to the existing disconnect → reprovision self-heal.
+      logger.warn("[agent-sandbox] Stored ingress URL unparsable during reconcile", {
         agentId: rec.id,
         error: error instanceof Error ? error.message : String(error),
       });
@@ -8474,7 +8508,7 @@ export class ElizaSandboxService {
     // container we think it is — never persist an unverified repair.
     const reachable = await this.probeBridgeHealth({ ...rec, bridge_url: bridgeUrl });
     if (!reachable) return { outcome: "unrepairable" };
-    return { outcome: "repaired", headscaleIp: currentIp, bridgeUrl };
+    return { outcome: "repaired", headscaleIp: currentIp, bridgeUrl, healthUrl };
   }
 
   private async verifyReplacementRuntimeHealth(args: {
@@ -8693,6 +8727,7 @@ export class ElizaSandboxService {
       const revived = await agentSandboxesRepository.markReconnectedFromDisconnected(rec, {
         headscaleIp: reconcile.headscaleIp,
         bridgeUrl: reconcile.bridgeUrl,
+        healthUrl: reconcile.healthUrl,
         errorCount: 0,
       });
       if (!revived) return "gone";

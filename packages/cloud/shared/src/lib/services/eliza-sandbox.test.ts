@@ -3263,12 +3263,14 @@ describe("ElizaSandboxService tailnet-IP reconciliation", () => {
   const NEW_IP = "100.64.0.11";
   const STALE_BRIDGE = `http://${OLD_IP}:3000`;
   const REPAIRED_BRIDGE = `http://${NEW_IP}:3000`;
+  const STALE_HEALTH = `http://${OLD_IP}:3000/api`;
+  const REPAIRED_HEALTH = `http://${NEW_IP}:3000/api`;
 
   function staleIpSandbox(overrides: Partial<AgentSandbox> = {}): AgentSandbox {
     return {
       ...customSandbox(),
       bridge_url: STALE_BRIDGE,
-      health_url: `${STALE_BRIDGE}/api`,
+      health_url: STALE_HEALTH,
       headscale_ip: OLD_IP,
       // 200s ago > 120s grace — the reconcile path only runs past grace.
       last_heartbeat_at: new Date(Date.now() - 200_000),
@@ -3348,6 +3350,7 @@ describe("ElizaSandboxService tailnet-IP reconciliation", () => {
       expect(id).toBe(sandbox.id);
       expect(patch.headscale_ip).toBe(NEW_IP);
       expect(patch.bridge_url).toBe(REPAIRED_BRIDGE);
+      expect(patch.health_url).toBe(REPAIRED_HEALTH);
       expect(patch.last_heartbeat_at).toBeInstanceOf(Date);
       expect(patch.error_count).toBe(0);
       // The row must NOT be disconnected — the whole point is no reprovision.
@@ -3420,6 +3423,44 @@ describe("ElizaSandboxService tailnet-IP reconciliation", () => {
       getClientSpy.mockRestore();
     }
   }, 20_000);
+
+  test("(c2) heartbeat: only repairs a coherent prior tailnet generation", async () => {
+    const { ElizaSandboxService } = await import("./eliza-sandbox.ts?actual");
+    const invalidGenerations: Partial<AgentSandbox>[] = [
+      { headscale_ip: null },
+      { health_url: "http://100.64.0.12:3000/api" },
+      { health_url: `http://${OLD_IP}:3001/api` },
+    ];
+
+    for (const invalidGeneration of invalidGenerations) {
+      const sandbox = staleIpSandbox(invalidGeneration);
+      const findSpy = spyOn(agentSandboxesRepository, "findRunningSandbox").mockResolvedValue(
+        sandbox,
+      );
+      const updateSpy = spyOn(agentSandboxesRepository, "update").mockResolvedValue(
+        undefined as never,
+      );
+      const nodeSpy = spyOn(dockerNodesRepository, "findByNodeId").mockResolvedValue(nodeRecord());
+      const { getClientSpy } = mockNodeSsh({ health: "healthy", tailscaleIp: NEW_IP });
+      fetchAliveOnlyOnNewIp();
+
+      try {
+        const ok = await new ElizaSandboxService().heartbeat(sandbox.id, sandbox.organization_id);
+        expect(ok).toBe(false);
+        expect(updateSpy).toHaveBeenCalledTimes(1);
+        const [, patch] = updateSpy.mock.calls[0] as [string, Record<string, unknown>];
+        expect(patch.status).toBe("disconnected");
+        expect(patch.headscale_ip).toBeUndefined();
+        expect(patch.bridge_url).toBeUndefined();
+        expect(patch.health_url).toBeUndefined();
+      } finally {
+        findSpy.mockRestore();
+        updateSpy.mockRestore();
+        nodeSpy.mockRestore();
+        getClientSpy.mockRestore();
+      }
+    }
+  }, 30_000);
 
   test("(d) heartbeat: docker-healthy + IP unresolvable guards error_count and escalates to disconnected on the 3rd cycle", async () => {
     const { ElizaSandboxService } = await import("./eliza-sandbox.ts?actual");
@@ -3501,6 +3542,7 @@ describe("ElizaSandboxService tailnet-IP reconciliation", () => {
         {
           headscaleIp: NEW_IP,
           bridgeUrl: REPAIRED_BRIDGE,
+          healthUrl: REPAIRED_HEALTH,
           errorCount: 0,
         },
       ]);

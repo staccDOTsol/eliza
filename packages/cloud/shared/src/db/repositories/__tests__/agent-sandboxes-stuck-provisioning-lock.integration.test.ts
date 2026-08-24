@@ -462,6 +462,7 @@ realPostgres("stuck provisioning lifecycle lock", () => {
 
     const repairedIngress = {
       bridgeUrl: `https://repaired-${identifierSuffix}.example`,
+      healthUrl: `https://repaired-${identifierSuffix}.example/api/health`,
       headscaleIp: "100.64.0.41",
       errorCount: 0,
     };
@@ -534,6 +535,7 @@ realPostgres("stuck provisioning lifecycle lock", () => {
       expect(await currentSandboxCapture(sandbox.id)).toMatchObject({
         status: "disconnected",
         bridge_url: sandbox.bridge_url,
+        health_url: sandbox.health_url,
         headscale_ip: sandbox.headscale_ip,
         error_count: 3,
       });
@@ -551,6 +553,7 @@ realPostgres("stuck provisioning lifecycle lock", () => {
       ).toMatchObject({
         status: "running",
         bridge_url: repairedIngress.bridgeUrl,
+        health_url: repairedIngress.healthUrl,
         headscale_ip: repairedIngress.headscaleIp,
         error_count: 0,
       });

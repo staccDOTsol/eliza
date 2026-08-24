@@ -582,12 +582,14 @@ describe("stuck-provisioning owner predicates", () => {
       await repo.markReconnectedFromDisconnected(generationA, {
         headscaleIp: "100.64.0.99",
         bridgeUrl: "https://stale-repair.example",
+        healthUrl: "https://stale-repair.example/api/health",
         errorCount: 0,
       }),
     ).toBeUndefined();
     expect(await sandboxCapture(agentId)).toMatchObject({
       status: "disconnected",
       bridge_url: "https://bridge-b.example",
+      health_url: "https://bridge-b.example/api/health",
       headscale_ip: "100.64.0.91",
       error_count: 3,
     });
@@ -596,11 +598,13 @@ describe("stuck-provisioning owner predicates", () => {
       await repo.markReconnectedFromDisconnected(generationB, {
         headscaleIp: "100.64.0.92",
         bridgeUrl: "https://repaired-b.example",
+        healthUrl: "https://repaired-b.example/api/health",
         errorCount: 0,
       }),
     ).toMatchObject({
       status: "running",
       bridge_url: "https://repaired-b.example",
+      health_url: "https://repaired-b.example/api/health",
       headscale_ip: "100.64.0.92",
       error_count: 0,
     });

@@ -786,6 +786,7 @@ describe("AgentSandboxesRepository", () => {
       {
         headscaleIp: "100.64.0.8",
         bridgeUrl: "https://bridge-generation-8.example",
+        healthUrl: "https://bridge-generation-8.example/api/health",
         errorCount: 0,
       },
     );
@@ -811,6 +812,7 @@ describe("AgentSandboxesRepository", () => {
       status: "running",
       headscale_ip: "100.64.0.8",
       bridge_url: "https://bridge-generation-8.example",
+      health_url: "https://bridge-generation-8.example/api/health",
       error_count: 0,
     });
   });

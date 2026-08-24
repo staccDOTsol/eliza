@@ -206,6 +206,7 @@ export type DisconnectedRecoveryCapture = ProvisioningRecoveryCapture &
 export interface RepairedDisconnectedIngress {
   headscaleIp: string;
   bridgeUrl: string;
+  healthUrl: string;
   errorCount?: number;
 }
 
@@ -1583,6 +1584,7 @@ export class AgentSandboxesRepository {
             ? {
                 headscale_ip: repairedIngress.headscaleIp,
                 bridge_url: repairedIngress.bridgeUrl,
+                health_url: repairedIngress.healthUrl,
                 ...(repairedIngress.errorCount === undefined
                   ? {}
                   : { error_count: repairedIngress.errorCount }),
