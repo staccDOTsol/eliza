@@ -5,6 +5,7 @@
 import type { Meta, StoryObj } from "@storybook/react";
 import { withMockApp } from "../../storybook/mock-providers.helpers";
 import { DynamicViewLoader } from "./DynamicViewLoader";
+import { ViewErrorState } from "./ViewStatusStates";
 
 /**
  * DynamicViewLoader dynamically imports a remote view bundle and mounts it
@@ -53,10 +54,14 @@ export const Loading: Story = {};
  * settles into its error state showing the failing view id.
  */
 export const FailedToLoad: Story = {
-  args: {
-    bundleUrl: "https://invalid.example.invalid/missing-bundle.js",
-    viewId: "broken.view",
-  },
+  render: () => (
+    <ViewErrorState
+      viewId="broken.view"
+      error={new Error("The view bundle could not be loaded.")}
+      onRetry={() => {}}
+      onBack={() => {}}
+    />
+  ),
 };
 
 /** Forwarded view props are merged in before the bundle mounts. */

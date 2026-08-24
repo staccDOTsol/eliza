@@ -115,4 +115,10 @@ export const Closed: Story = {
   args: {
     open: false,
   },
+  render: (args) => (
+    <div className="rounded-sm border border-border bg-card p-4 text-sm text-muted-strong">
+      <CustomActionEditor {...args} />
+      The custom action editor is closed.
+    </div>
+  ),
 };

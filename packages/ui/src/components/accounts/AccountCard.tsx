@@ -209,12 +209,14 @@ export function AccountCard({
   const requiresCredentialRepair =
     account.health === "needs-reauth" || account.health === "invalid";
   const healthReason = account.healthDetail?.lastError?.trim();
+  const testLabel = t("accounts.test", { defaultValue: "Test" });
+  const refreshLabel = t("accounts.refresh", { defaultValue: "Refresh" });
 
   return (
     <div
       className={cn(
-        "flex flex-col gap-2 rounded-sm border border-border/45 bg-card/35 px-3 py-2.5 transition-opacity",
-        !account.enabled && "opacity-60",
+        "flex flex-col gap-2 rounded-sm border border-border/45 bg-card/35 px-3 py-2.5 transition-colors",
+        !account.enabled && "border-dashed bg-bg-muted/40",
       )}
     >
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
@@ -328,12 +330,9 @@ export function AccountCard({
             size="sm"
             disabled={testBusy || saving}
             onClick={() => void onTest()}
+            aria-label={testLabel}
           >
-            {testBusy ? (
-              <Spinner className="size-3" />
-            ) : (
-              t("accounts.test", { defaultValue: "Test" })
-            )}
+            {testBusy ? <Spinner className="size-3" aria-hidden /> : testLabel}
           </Button>
           <Button
             type="button"
@@ -341,11 +340,12 @@ export function AccountCard({
             size="sm"
             disabled={refreshBusy || saving}
             onClick={() => void onRefreshUsage()}
+            aria-label={refreshLabel}
           >
             {refreshBusy ? (
-              <Spinner className="size-3" />
+              <Spinner className="size-3" aria-hidden />
             ) : (
-              t("accounts.refresh", { defaultValue: "Refresh" })
+              refreshLabel
             )}
           </Button>
           <Button

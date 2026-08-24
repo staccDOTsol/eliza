@@ -94,4 +94,10 @@ export const IMessageWithCloud: Story = {
     initialMode: "direct",
     elizaCloudConnected: true,
   },
+  render: (args) => (
+    <div className="rounded-sm border border-border bg-card p-4 text-sm text-muted-strong">
+      <Wrapper {...args} />
+      iMessage has one connection mode, so no mode selector is needed.
+    </div>
+  ),
 };
