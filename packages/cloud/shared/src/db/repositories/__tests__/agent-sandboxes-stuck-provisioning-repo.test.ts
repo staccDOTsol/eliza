@@ -440,4 +440,74 @@ describe("stuck-provisioning owner predicates", () => {
     expect((await repo.markRunningFromProvisioning(agentId))?.id).toBe(agentId);
     expect(await sandboxStatus(agentId)).toBe("running");
   });
+
+  test("recovery CAS never promotes forged Shared or unknown rows with container locators", async () => {
+    for (const executionTier of ["shared", "future-container-tier"] as const) {
+      const { organizationId, userId } = await seedOrgAndUser();
+      const agentId = await seedProvisioningAgent(organizationId, userId);
+      await dbWrite
+        .update(agentSandboxes)
+        .set({ execution_tier: executionTier as never })
+        .where(eq(agentSandboxes.id, agentId));
+
+      expect(await repo.markRunningFromProvisioning(agentId)).toBeUndefined();
+      expect(await sandboxStatus(agentId)).toBe("provisioning");
+    }
+  });
+
+  test("stuck-provisioning sweep ignores forged Shared and unknown rows", async () => {
+    for (const executionTier of ["shared", "future-container-tier"] as const) {
+      const { organizationId, userId } = await seedOrgAndUser();
+      const agentId = await seedProvisioningAgent(organizationId, userId);
+      await dbWrite
+        .update(agentSandboxes)
+        .set({ execution_tier: executionTier as never })
+        .where(eq(agentSandboxes.id, agentId));
+
+      const swept = await repo.markStuckProvisioningWithoutActiveJobAsError(SWEEP_CUTOFF);
+      expect(swept.updated.map((row) => row.agentId)).not.toContain(agentId);
+      expect(await sandboxStatus(agentId)).toBe("provisioning");
+    }
+  });
+
+  test("reconnection loses when the execution tier changes to Shared during the bridge probe", async () => {
+    const { organizationId, userId } = await seedOrgAndUser();
+    const agentId = await seedProvisioningAgent(organizationId, userId);
+    await dbWrite
+      .update(agentSandboxes)
+      .set({
+        status: "disconnected",
+        bridge_url: "https://reconnect-race.example",
+        health_url: "https://reconnect-race.example/api/health",
+        environment_vars: { ELIZA_API_TOKEN: "reconnect-race-token" },
+      })
+      .where(eq(agentSandboxes.id, agentId));
+
+    const originalFetch = globalThis.fetch;
+    let probeCount = 0;
+    globalThis.fetch = async () => {
+      probeCount += 1;
+      await dbWrite
+        .update(agentSandboxes)
+        .set({ execution_tier: "shared" })
+        .where(eq(agentSandboxes.id, agentId));
+      return new Response("ok", { status: 200 });
+    };
+
+    try {
+      const { ElizaSandboxService } = await import("../../../lib/services/eliza-sandbox");
+      expect(await new ElizaSandboxService().recoverDisconnected(agentId, organizationId)).toBe(
+        "gone",
+      );
+      expect(probeCount).toBe(1);
+      expect(await repo.findById(agentId)).toEqual(
+        expect.objectContaining({
+          status: "disconnected",
+          execution_tier: "shared",
+        }),
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

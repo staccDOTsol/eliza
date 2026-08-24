@@ -108,6 +108,23 @@ async function waitForAdvisoryWaiters(observer: Client, minimum: number): Promis
   throw new Error(`Timed out waiting for ${minimum} advisory-lock waiter(s)`);
 }
 
+async function waitForAgentSandboxRowLockWaiters(observer: Client, minimum: number): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const result = await observer.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+       FROM pg_stat_activity
+       WHERE datname = current_database()
+         AND pid <> pg_backend_pid()
+         AND wait_event_type = 'Lock'
+         AND query ILIKE '%agent_sandboxes%'`,
+    );
+    if (Number(result.rows[0]?.count ?? 0) >= minimum) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for ${minimum} agent_sandboxes row-lock waiter(s)`);
+}
+
 if (!postgres) {
   console.warn(SKIP_REASON);
 } else {
@@ -540,6 +557,65 @@ realPostgres("stuck provisioning lifecycle lock", () => {
     } finally {
       await lock.query("ROLLBACK");
       await lock.end();
+    }
+  }, 30_000);
+
+  test("markRunning loses a real multi-session tier race before its final CAS", async () => {
+    if (!isolatedDsn || !dbWrite || !agentSandboxesRepository) {
+      throw new Error("real PostgreSQL harness was not initialized");
+    }
+    const suffix = randomUUID();
+    const [organization] = await dbWrite
+      .insert(organizations)
+      .values({ name: "Tier Race Org", slug: `tier-race-${suffix}` })
+      .returning();
+    const [user] = await dbWrite
+      .insert(users)
+      .values({
+        steward_user_id: `tier-race-${suffix}`,
+        organization_id: organization.id,
+      })
+      .returning();
+    const [sandbox] = await dbWrite
+      .insert(agentSandboxes)
+      .values({
+        organization_id: organization.id,
+        user_id: user.id,
+        agent_name: `tier-race-${suffix}`,
+        status: "provisioning",
+        execution_tier: "dedicated-always",
+        sandbox_id: `sandbox-${suffix}`,
+        node_id: `node-${suffix}`,
+        container_name: `container-${suffix}`,
+      })
+      .returning();
+
+    const control = new Client({ connectionString: isolatedDsn });
+    await control.connect();
+    try {
+      await control.query("BEGIN");
+      await control.query("SELECT id FROM agent_sandboxes WHERE id = $1 FOR UPDATE", [sandbox.id]);
+
+      // The repository's unlocked candidate read sees the canonical tier, then
+      // its final UPDATE blocks on this session's row lock. Flip to Shared in
+      // the lock-owning session before releasing it: the tier-qualified final
+      // CAS must observe the committed change and affect zero rows.
+      const recovery = agentSandboxesRepository.markRunningFromProvisioning(sandbox.id);
+      await waitForAgentSandboxRowLockWaiters(control, 1);
+      await control.query("UPDATE agent_sandboxes SET execution_tier = 'shared' WHERE id = $1", [
+        sandbox.id,
+      ]);
+      await control.query("COMMIT");
+
+      expect(await recovery).toBeUndefined();
+      const [persisted] = await dbWrite
+        .select({ status: agentSandboxes.status, executionTier: agentSandboxes.execution_tier })
+        .from(agentSandboxes)
+        .where(eq(agentSandboxes.id, sandbox.id));
+      expect(persisted).toEqual({ status: "provisioning", executionTier: "shared" });
+    } finally {
+      await control.query("ROLLBACK");
+      await control.end();
     }
   }, 30_000);
 

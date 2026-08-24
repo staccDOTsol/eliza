@@ -453,19 +453,43 @@ describe("AgentSandboxesRepository", () => {
     const sql = query.sql.toLowerCase();
     // Only running rows are heartbeated...
     expect(sql).toContain("status");
-    // ...and shared-tier rows are filtered out: they run container-free in the
-    // hosted shared runtime, so dialing them over Headscale always fails. The
-    // `<>` keeps that exclusion (NOT just `= 'shared'`).
+    // ...and only the canonical container-backed tiers are admitted. An
+    // unknown future tier must not silently join the heartbeat fleet.
     expect(sql).toContain("execution_tier");
-    expect(sql).toContain("<>");
-    // eq/ne bind their operands, so the values land in `params`, not the SQL.
+    expect(sql).toContain(" in ");
+    // Drizzle binds allowlist values as params.
     expect(query.params).toContain("running");
-    expect(query.params).toContain("shared");
+    expect(query.params).toContain("dedicated-lazy");
+    expect(query.params).toContain("dedicated-always");
+    expect(query.params).toContain("custom");
+    expect(query.params).not.toContain("shared");
+    expect(query.params).not.toContain("future-container-tier");
     // #22548: soft-deleted rows and unclaimed warm-pool rows must never be
     // dialed — both guards are present, matching the sibling predicates.
     expect(sql).toContain("deleted_at");
     expect(sql).toContain("pool_status");
     expect((sql.match(/is null/g) ?? []).length).toBeGreaterThanOrEqual(2);
+  });
+
+  test("single-agent heartbeat lookup admits only canonical container tiers", async () => {
+    capturedWhere = undefined;
+    useWriteSelectMock = true;
+
+    const { AgentSandboxesRepository } = await import("./agent-sandboxes");
+
+    await new AgentSandboxesRepository().findRunningSandbox(
+      "e06bb509-6c52-4c33-a9f7-66addc43e8c8",
+      "c21ed7f4-4d97-4b69-a09a-71a6af758591",
+    );
+
+    if (!capturedWhere) throw new Error("findRunningSandbox did not build a where clause");
+    const query = new PgDialect().sqlToQuery(capturedWhere);
+    expect(query.sql.toLowerCase()).toContain("execution_tier");
+    expect(query.params).toContain("dedicated-lazy");
+    expect(query.params).toContain("dedicated-always");
+    expect(query.params).toContain("custom");
+    expect(query.params).not.toContain("shared");
+    expect(query.params).not.toContain("future-container-tier");
   });
 
   test("dedicated fleet census groups by tier AND status over the container-backed fleet (#22548)", async () => {
@@ -551,8 +575,13 @@ describe("AgentSandboxesRepository", () => {
         "node-generation-7",
         "agent-generation-7",
         42,
+        "dedicated-lazy",
+        "dedicated-always",
+        "custom",
       ]),
     );
+    expect(query.params).not.toContain("shared");
+    expect(query.params).not.toContain("future-container-tier");
   });
 
   test("generic repository updates cannot write through a durable deletion owner", async () => {
@@ -677,8 +706,30 @@ describe("AgentSandboxesRepository", () => {
     const sql = new PgDialect().sqlToQuery(capturedWhere).sql.toLowerCase();
     expect(sql).toContain("sandbox_id");
     expect(sql).toContain("node_id");
+    expect(sql).toContain("execution_tier");
     expect(sql).toContain("is not null");
     expect(sql).toContain("<> ''");
+  });
+
+  test("reconnection CAS admits only the canonical container-backed tiers", async () => {
+    capturedWhere = undefined;
+
+    const { AgentSandboxesRepository } = await import("./agent-sandboxes");
+    await new AgentSandboxesRepository().markReconnectedFromDisconnected(
+      "e06bb509-6c52-4c33-a9f7-66addc43e8c8",
+    );
+
+    if (!capturedWhere) {
+      throw new Error("markReconnectedFromDisconnected did not build a where clause");
+    }
+    const query = new PgDialect().sqlToQuery(capturedWhere);
+    const sql = query.sql.toLowerCase();
+    expect(sql).toContain("execution_tier");
+    expect(sql).toContain(" in (");
+    expect(query.params).toContain("dedicated-lazy");
+    expect(query.params).toContain("dedicated-always");
+    expect(query.params).toContain("custom");
+    expect(query.params).not.toContain("shared");
   });
 
   test("fleet-upgrade candidates re-arm on a NEW target after a rollback-safe upgrade failure (#15357)", async () => {

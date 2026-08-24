@@ -21,7 +21,6 @@ import {
   isNull,
   lt,
   lte,
-  ne,
   notInArray,
   or,
   type SQL,
@@ -561,7 +560,7 @@ export class AgentSandboxesRepository {
       .where(
         and(
           eq(agentSandboxes.status, "running"),
-          ne(agentSandboxes.execution_tier, "shared"),
+          inArray(agentSandboxes.execution_tier, [...CONTAINER_BACKED_EXECUTION_TIERS]),
           isNull(agentSandboxes.deleted_at),
           isNull(agentSandboxes.pool_status),
         ),
@@ -783,7 +782,7 @@ export class AgentSandboxesRepository {
         and(
           inArray(agentSandboxes.organization_id, organizationIds),
           eq(agentSandboxes.status, "running"),
-          ne(agentSandboxes.execution_tier, "shared"),
+          inArray(agentSandboxes.execution_tier, [...CONTAINER_BACKED_EXECUTION_TIERS]),
           sql`${agentSandboxes.deleted_at} IS NULL`,
         ),
       );
@@ -1060,6 +1059,7 @@ export class AgentSandboxesRepository {
           eq(agentSandboxes.id, id),
           eq(agentSandboxes.organization_id, orgId),
           eq(agentSandboxes.status, "running"),
+          inArray(agentSandboxes.execution_tier, [...CONTAINER_BACKED_EXECUTION_TIERS]),
         ),
       )
       .limit(1);
@@ -1113,6 +1113,7 @@ export class AgentSandboxesRepository {
       .where(
         and(
           eq(agentSandboxes.status, "provisioning"),
+          inArray(agentSandboxes.execution_tier, [...CONTAINER_BACKED_EXECUTION_TIERS]),
           lt(agentSandboxes.updated_at, cutoff),
           hasNoProvisioningStatusOwnerJob(),
         ),
@@ -1150,6 +1151,7 @@ export class AgentSandboxesRepository {
               eq(agentSandboxes.id, candidate.agentId),
               eq(agentSandboxes.organization_id, candidate.organizationId),
               eq(agentSandboxes.status, "provisioning"),
+              inArray(agentSandboxes.execution_tier, [...CONTAINER_BACKED_EXECUTION_TIERS]),
               lt(agentSandboxes.updated_at, cutoff),
               hasNoProvisioningStatusOwnerJob(),
             ),
@@ -1326,6 +1328,7 @@ export class AgentSandboxesRepository {
       predicates.push(
         eq(agentSandboxes.organization_id, expectedRunningGeneration.organizationId),
         eq(agentSandboxes.status, "running"),
+        inArray(agentSandboxes.execution_tier, [...CONTAINER_BACKED_EXECUTION_TIERS]),
         eq(agentSandboxes.environment_revision, expectedRunningGeneration.environmentRevision),
         sql`${agentSandboxes.sandbox_id} IS NOT DISTINCT FROM ${expectedRunningGeneration.sandboxId}`,
         sql`${agentSandboxes.node_id} IS NOT DISTINCT FROM ${expectedRunningGeneration.nodeId}`,
@@ -1500,6 +1503,7 @@ export class AgentSandboxesRepository {
         and(
           eq(agentSandboxes.id, id),
           eq(agentSandboxes.status, expectedStatus),
+          inArray(agentSandboxes.execution_tier, [...CONTAINER_BACKED_EXECUTION_TIERS]),
           sql`${agentSandboxes.bridge_url} IS NOT NULL`,
           sql`${expectedStatus} != 'error' OR (${agentSandboxes.previous_image_digest} IS NOT NULL AND ${agentSandboxes.error_message} IS NULL)`,
           sql`${agentSandboxes.deleted_at} IS NULL`,
@@ -1527,6 +1531,7 @@ export class AgentSandboxesRepository {
         and(
           eq(agentSandboxes.id, id),
           eq(agentSandboxes.status, "provisioning"),
+          inArray(agentSandboxes.execution_tier, [...CONTAINER_BACKED_EXECUTION_TIERS]),
           sql`${agentSandboxes.sandbox_id} IS NOT NULL`,
           sql`${agentSandboxes.node_id} IS NOT NULL`,
           sql`${agentSandboxes.node_id} <> ''`,
@@ -1557,6 +1562,7 @@ export class AgentSandboxesRepository {
             eq(agentSandboxes.id, id),
             eq(agentSandboxes.organization_id, candidate.organizationId),
             eq(agentSandboxes.status, "provisioning"),
+            inArray(agentSandboxes.execution_tier, [...CONTAINER_BACKED_EXECUTION_TIERS]),
             sql`${agentSandboxes.sandbox_id} IS NOT NULL`,
             sql`${agentSandboxes.node_id} IS NOT NULL`,
             sql`${agentSandboxes.node_id} <> ''`,

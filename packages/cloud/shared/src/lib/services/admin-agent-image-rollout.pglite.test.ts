@@ -226,6 +226,7 @@ async function seedAgents(count: number): Promise<{
       user_id: actor.id,
       agent_name: `Canary ${index}`,
       status: "running",
+      execution_tier: "dedicated-always",
       sandbox_id: `sandbox-${index}`,
       node_id: `node-${index}`,
       container_name: `agent-${index}`,
@@ -902,6 +903,131 @@ describe("admin agent image rollout on primary PGlite", () => {
       (await dbWrite.select().from(dockerNodes).where(eq(dockerNodes.node_id, "node-new")))[0]
         ?.allocated_count,
     ).toBe(2);
+  });
+
+  test("replacement cleanup rejects a forged Shared row before provider, fence, or node writes", async () => {
+    const seeded = await seedAgents(1);
+    const agentId = seeded.targets[0]!.agentId;
+    await dbWrite.insert(dockerNodes).values({
+      node_id: "node-shared-cleanup",
+      hostname: "node-shared-cleanup.internal",
+      status: "healthy",
+      enabled: true,
+      capacity: 8,
+      allocated_count: 3,
+    });
+    await dbWrite
+      .update(agentSandboxes)
+      .set({
+        execution_tier: "shared",
+        replacement_cleanup_sandbox_id: "shared-cleanup-sandbox",
+        replacement_cleanup_node_id: "node-shared-cleanup",
+        replacement_cleanup_container_name: "shared-cleanup-container",
+        replacement_cleanup_attempt_id: null,
+        replacement_cleanup_container_id: null,
+        replacement_cleanup_vpn_node_id: "shared-cleanup-vpn",
+        replacement_cleanup_vpn_node_name: null,
+        replacement_cleanup_preserved_vpn_node_id: null,
+        replacement_cleanup_vpn_registration_started_at: null,
+        replacement_cleanup_allocation_counted: true,
+        replacement_cleanup_created_at: new Date(),
+      })
+      .where(eq(agentSandboxes.id, agentId));
+
+    const provider = new DockerSandboxProvider();
+    const cleanup = spyOn(provider, "stopOnSpecificNodeForReplacement").mockResolvedValue(
+      undefined,
+    );
+    const service = new ElizaSandboxService(provider as unknown as SandboxProvider);
+
+    expect(await service.reconcileReplacementCleanupFences()).toEqual({
+      total: 0,
+      retired: 0,
+      failed: 0,
+    });
+    await expect(
+      service.convergeReplacementCleanupFence(agentId, seeded.organizationId),
+    ).rejects.toThrow("Agent replacement requires a container-backed execution tier");
+    expect(cleanup).not.toHaveBeenCalled();
+    expect(await agentSandboxesRepository.findByIdAndOrg(agentId, seeded.organizationId)).toEqual(
+      expect.objectContaining({
+        execution_tier: "shared",
+        replacement_cleanup_sandbox_id: "shared-cleanup-sandbox",
+        replacement_cleanup_node_id: "node-shared-cleanup",
+        replacement_cleanup_container_name: "shared-cleanup-container",
+        replacement_cleanup_allocation_counted: true,
+      }),
+    );
+    expect(
+      (
+        await dbWrite
+          .select()
+          .from(dockerNodes)
+          .where(eq(dockerNodes.node_id, "node-shared-cleanup"))
+      )[0]?.allocated_count,
+    ).toBe(3);
+  });
+
+  test("replacement cleanup preserves its fence and node count when the tier changes before release", async () => {
+    const seeded = await seedAgents(1);
+    const agentId = seeded.targets[0]!.agentId;
+    await dbWrite.insert(dockerNodes).values({
+      node_id: "node-cleanup-tier-race",
+      hostname: "node-cleanup-tier-race.internal",
+      status: "healthy",
+      enabled: true,
+      capacity: 8,
+      allocated_count: 3,
+    });
+    await dbWrite
+      .update(agentSandboxes)
+      .set({
+        replacement_cleanup_sandbox_id: "cleanup-tier-race-sandbox",
+        replacement_cleanup_node_id: "node-cleanup-tier-race",
+        replacement_cleanup_container_name: "cleanup-tier-race-container",
+        replacement_cleanup_attempt_id: null,
+        replacement_cleanup_container_id: null,
+        replacement_cleanup_vpn_node_id: "cleanup-tier-race-vpn",
+        replacement_cleanup_vpn_node_name: null,
+        replacement_cleanup_preserved_vpn_node_id: null,
+        replacement_cleanup_vpn_registration_started_at: null,
+        replacement_cleanup_allocation_counted: true,
+        replacement_cleanup_created_at: new Date(),
+      })
+      .where(eq(agentSandboxes.id, agentId));
+
+    const provider = new DockerSandboxProvider();
+    const cleanup = spyOn(provider, "stopOnSpecificNodeForReplacement").mockImplementation(
+      async () => {
+        await dbWrite
+          .update(agentSandboxes)
+          .set({ execution_tier: "shared" })
+          .where(eq(agentSandboxes.id, agentId));
+      },
+    );
+    const service = new ElizaSandboxService(provider as unknown as SandboxProvider);
+
+    await expect(
+      service.convergeReplacementCleanupFence(agentId, seeded.organizationId),
+    ).rejects.toThrow("Agent replacement requires a container-backed execution tier");
+    expect(cleanup).toHaveBeenCalledTimes(1);
+    expect(await agentSandboxesRepository.findByIdAndOrg(agentId, seeded.organizationId)).toEqual(
+      expect.objectContaining({
+        execution_tier: "shared",
+        replacement_cleanup_sandbox_id: "cleanup-tier-race-sandbox",
+        replacement_cleanup_node_id: "node-cleanup-tier-race",
+        replacement_cleanup_container_name: "cleanup-tier-race-container",
+        replacement_cleanup_allocation_counted: true,
+      }),
+    );
+    expect(
+      (
+        await dbWrite
+          .select()
+          .from(dockerNodes)
+          .where(eq(dockerNodes.node_id, "node-cleanup-tier-race"))
+      )[0]?.allocated_count,
+    ).toBe(3);
   });
 
   test("replacement cleanup sweep waits for lifecycle completion and candidate grace", async () => {
