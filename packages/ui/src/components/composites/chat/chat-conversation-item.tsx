@@ -65,7 +65,7 @@ function TruncatingConversationTitle({
         variant === "game-modal"
           ? `block w-full min-w-0 max-w-full truncate text-left text-sm font-medium leading-tight transition-colors ${
               isActive
-                ? "text-txt text-shadow-glow"
+                ? "text-[color:var(--first-run-accent-foreground)] text-shadow-glow"
                 : "text-white/90 group-hover:text-white"
             }`
           : `block min-w-0 max-w-full flex-1 truncate text-left text-sm font-normal leading-snug transition-colors ${
