@@ -397,6 +397,7 @@ async function installMutableFirstRun(page: Page): Promise<FirstRunControl> {
 async function injectFullCapabilityHost(page: Page): Promise<void> {
   await page.addInitScript(() => {
     const win = window as unknown as Record<string, unknown>;
+    const secureStore = new Map<string, string>();
     win.__ELIZA_APP_API_BASE__ = window.location.origin;
     win.__electrobunWindowId = 1;
     // The journey advertises desktop capability so local onboarding remains
@@ -407,6 +408,20 @@ async function injectFullCapabilityHost(page: Page): Promise<void> {
         desktopGetVersion: async () => ({ runtime: "walkthrough-test" }),
         desktopRegisterShortcut: async () => ({ success: true }),
         desktopSetTrayMenu: async () => undefined,
+        secureStoreGet: async (params: { kind: string }) => {
+          const value = secureStore.get(params.kind);
+          return value === undefined
+            ? { ok: false, reason: "not_found" }
+            : { ok: true, value };
+        },
+        secureStoreSet: async (params: { kind: string; value: string }) => {
+          secureStore.set(params.kind, params.value);
+          return { ok: true };
+        },
+        secureStoreDelete: async (params: { kind: string }) => {
+          const deleted = secureStore.delete(params.kind);
+          return { ok: true, deleted };
+        },
       },
       onMessage: () => undefined,
       offMessage: () => undefined,
