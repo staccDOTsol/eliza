@@ -24,16 +24,19 @@ its three load-bearing behaviors:
 
 ## How a call gets paid
 
-1. **Group credit** — the room's burner has prepaid gateway credit → the
-   call draws it down, zero chain traffic.
-2. **Group top-up** — the burner holds tokens but no credit → buy as much
-   credit as the wallet covers in ONE x402 settlement, retry.
-3. **Operator wallet** — no burner in scope, or the group is broke → the
-   agent's own machine wallet (`~/.openzoo/wallet.json`) pays via openzoo's
-   PayClient, or `OPENZOO_SUBSCRIPTION_KEY` if set.
+x402 only — there is no subscription lane and no operator subsidy for
+chats. Every DM, group and chat is its own burner.
 
-Set `OPENZOO_ELIZA_GROUP_STRICT=1` to refuse instead of falling back when a
-group is unfunded.
+1. **Chat credit** — the chat's burner has prepaid gateway credit → the
+   call draws it down, zero chain traffic.
+2. **Chat top-up** — the burner holds tokens but no credit → buy as much
+   credit as the wallet covers in ONE x402 settlement, retry.
+3. **Broke chat** — the chat sees the paywall echo, in-chat: its own
+   burner address, what to send, and the quoted price. Fund it, `/topup`,
+   ask again.
+
+Calls with no chat in scope (autonomy loops, the control UI, warmups)
+settle x402 from the agent's own machine wallet (`~/.openzoo/wallet.json`).
 
 ## Connector behavior (forked in this repo)
 
@@ -74,7 +77,6 @@ little SOL and the agent is self-sustaining.
 |---|---|---|
 | `OPENZOO_API_BASE` | `https://x402-tokens.fly.dev` | gateway |
 | `OPENZOO_SMALL_MODEL` / `OPENZOO_LARGE_MODEL` | `openzoo/auto` | the gateway picks a cheap model that is good enough; the receipt names it |
-| `OPENZOO_SUBSCRIPTION_KEY` | — | optional; skip x402 and bill a subscription |
 | `OPENZOO_KNOWLEDGE` | on | `0` disables the $HOME/open* + $HOME/lecore crawl |
 | `OPENZOO_KNOWLEDGE_ROOTS` | — | extra `:`-separated roots to bind |
 | `OPENZOO_ELIZA_GROUP_WALLETS` | on | `0` = operator wallet pays everything |

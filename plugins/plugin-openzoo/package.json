@@ -85,7 +85,7 @@
       },
       "OPENZOO_SMALL_MODEL": {
         "type": "string",
-        "description": "Model for small/fast calls (default openzoo/auto — the gateway picks a cheap model that is good enough)",
+        "description": "Model for small/fast calls (default openzoo/auto \u2014 the gateway picks a cheap model that is good enough)",
         "required": false,
         "default": "openzoo/auto",
         "sensitive": false
@@ -96,12 +96,6 @@
         "required": false,
         "default": "openzoo/auto",
         "sensitive": false
-      },
-      "OPENZOO_SUBSCRIPTION_KEY": {
-        "type": "string",
-        "description": "Optional subscription key. Without it every call settles x402 from the wallet — which is the point.",
-        "required": false,
-        "sensitive": true
       },
       "OPENZOO_KNOWLEDGE": {
         "type": "string",
@@ -123,7 +117,7 @@
     ],
     "runtime": "node",
     "platformDetails": {
-      "node": "Node/Bun only — signs Solana transactions and reads the local filesystem"
+      "node": "Node/Bun only \u2014 signs Solana transactions and reads the local filesystem"
     }
   },
   "peerDependencies": {

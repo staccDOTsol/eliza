@@ -215,9 +215,8 @@ async function consumeSse(
  */
 export async function zooChat(
   body: Record<string, unknown>,
-  { contextId, subscriptionKey, signal, onStreamChunk }: {
+  { contextId, signal, onStreamChunk }: {
     contextId?: string | null;
-    subscriptionKey?: string;
     signal?: AbortSignal;
     onStreamChunk?: (delta: string) => void;
   } = {},
@@ -233,7 +232,11 @@ export async function zooChat(
     ...(contextId ? { 'x-hrr-context': contextId } : {}),
   };
 
-  // GROUP LANE — only when a burner is in scope.
+  // CHAT LANE — a burner in scope IS the payer, full stop. There is no
+  // subscription and no operator subsidy for chats: every DM, group and
+  // chat is its own burner, funded by its own people. A broke chat gets
+  // GroupUnderfundedError, which the connector echoes into the chat as a
+  // funding message — the xbot paywall, translated to Telegram.
   if (scope?.burner) {
     const burner = scope.burner;
     const attempt = () => fetch(url, {
@@ -244,9 +247,8 @@ export async function zooChat(
     });
     let res = await attempt();
     if (res.status === 402) {
-      // No credit. Try to buy some from whatever the group wallet holds,
-      // then retry ONCE — a second 402 means the group is genuinely broke,
-      // and the operator lane decides what happens next.
+      // No credit. Try to buy some from whatever the chat's wallet holds,
+      // then retry ONCE — a second 402 means the chat is genuinely broke.
       const { toppedUp } = await ensureGroupCredit(burner).catch(() => ({ toppedUp: 0 }));
       if (toppedUp > 0) res = await attempt();
     }
@@ -257,34 +259,25 @@ export async function zooChat(
     if (res.status !== 402) {
       throw new Error(`gateway ${res.status}: ${(await res.text()).slice(0, 200)}`);
     }
-    // fall through to operator lane below — the group being broke must not
-    // silence the agent unless the operator has opted into strict mode.
-    if (process.env.OPENZOO_ELIZA_GROUP_STRICT === '1') {
-      const quote: any = await res.json().catch(() => ({}));
-      const raw = Number(quote?.accepts?.[0]?.maxAmountRequired || 0);
-      throw new GroupUnderfundedError(burner.address, raw > 0 ? raw / 1e6 : 0);
-    }
+    const quote: any = await res.json().catch(() => ({}));
+    const raw = Number(quote?.accepts?.[0]?.maxAmountRequired || 0);
+    throw new GroupUnderfundedError(burner.address, raw > 0 ? raw / 1e6 : 0);
   }
 
-  // OPERATOR LANE — subscription key if configured, else PayClient handles
-  // the 402 → pay → replay dance from the machine wallet.
-  if (subscriptionKey) {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { ...base, authorization: `Bearer ${subscriptionKey}` },
-      body: JSON.stringify(body),
-      ...(signal ? { signal } : {}),
-    });
-    if (!res.ok) {
-      const err: any = await res.json().catch(() => ({}));
-      throw new Error(`gateway ${res.status}: ${JSON.stringify(err).slice(0, 200)}`);
-    }
-    const data: any = streaming ? await consumeSse(res, onStreamChunk) : await res.json();
-    return { data, receipt: receiptFrom(data), payer: 'operator' };
-  }
-
+  // NO SCOPE — internal calls (autonomy loops, the control UI, boot
+  // warmups) settle x402 from the agent's own machine wallet. Still no
+  // subscription: PayClient does the 402 → pay → replay dance.
   const { PayClient } = await import('openzoo/lib/pay.js');
   const pay = new PayClient();
+  // A wallet failure here still names a fundable address — the agent's own.
+  const wrapUnderfunded = (e: unknown): never => {
+    const msg = String((e as Error)?.message ?? e ?? '');
+    if (/402|underfund|insufficient|no offered payment row|afford/i.test(msg)) {
+      const m = msg.match(/"maxAmountRequired"\s*:\s*"?(\d+)/);
+      throw new GroupUnderfundedError(pay.address, m?.[1] ? Number(m[1]) / 1e6 : 0);
+    }
+    throw e;
+  };
   if (streaming) {
     // chat() parses JSON, so the streamed lane goes through fetch(), which
     // does the same 402 → pay → replay dance and hands back the live
@@ -293,10 +286,12 @@ export async function zooChat(
       method: 'POST',
       headers: base,
       body: JSON.stringify(body),
-    });
+    }).catch(wrapUnderfunded);
     const { response } = paid;
     if (!response.ok) {
-      throw new Error(`gateway ${response.status}: ${(await response.text()).slice(0, 200)}`);
+      const errText = (await response.text()).slice(0, 300);
+      if (response.status === 402) wrapUnderfunded(new Error(`402 ${errText}`));
+      throw new Error(`gateway ${response.status}: ${errText.slice(0, 200)}`);
     }
     const data = await consumeSse(response, onStreamChunk);
     const receipt = receiptFrom(data);
@@ -309,6 +304,6 @@ export async function zooChat(
     if (!(receipt.directUsd > 0) && Number(settled.directUsd) > 0) receipt.directUsd = Number(settled.directUsd);
     return { data, receipt, payer: 'operator' };
   }
-  const { data } = await pay.chat(body, { headers: base });
+  const { data } = await pay.chat(body, { headers: base }).catch(wrapUnderfunded);
   return { data, receipt: receiptFrom(data), payer: 'operator' };
 }

@@ -18,9 +18,6 @@
  *    persisted as ONE master key on disk (src/burner.ts).
  */
 
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 import {
   type IAgentRuntime,
   type Plugin,
@@ -63,16 +60,9 @@ function getSetting(runtime: IAgentRuntime, key: string, fallback?: string): str
 const DEFAULT_SMALL = 'openzoo/auto';
 const DEFAULT_LARGE = 'openzoo/auto';
 
-function subscriptionKey(runtime: IAgentRuntime): string | undefined {
-  const fromEnv = getSetting(runtime, 'OPENZOO_SUBSCRIPTION_KEY');
-  if (fromEnv) return fromEnv;
-  try {
-    const f = path.join(os.homedir(), '.openzoo', 'subscription.json');
-    return JSON.parse(fs.readFileSync(f, 'utf8')).key || undefined;
-  } catch {
-    return undefined; // x402 path instead — that is the point of the plugin
-  }
-}
+// There is no subscription lane. x402 is the only way anything gets paid:
+// every DM, group and chat settles from its own derived burner, and calls
+// with no chat in scope settle from the agent's machine wallet.
 
 /**
  * The service is the seam connectors talk to — looked up by name
@@ -165,6 +155,34 @@ export class OpenzooService extends Service {
   async topUp(chatId: string): Promise<{ balance: number; toppedUp: number }> {
     return ensureGroupCredit(deriveGroupBurner(chatId));
   }
+
+  /**
+   * The funding message a broke chat sees — xbot's paywall reply,
+   * translated to Telegram. Carries the chat's OWN burner address (grouped
+   * so lookalikes are checkable), what to send, and the quoted price when
+   * one is known, because "top up your wallet" without a number is an
+   * unanswerable instruction.
+   */
+  paywallMessage(chatId: string, quotedUsd = 0): string {
+    const burner = deriveGroupBurner(chatId);
+    const token = FUNDING_ASSETS.find((a) => a.symbol === 'TOKEN');
+    const leos = FUNDING_ASSETS.find((a) => a.symbol === 'LEOS');
+    return [
+      "this chat's wallet is out of funds — it pays x402 per question. send to:",
+      groupCa(burner.address),
+      '',
+      '+ a little SOL for fees (~0.02 is plenty)',
+      ...(quotedUsd > 0
+        ? [`this question quoted up to ${usd(quotedUsd)} — $1 covers roughly ${Math.max(1, Math.floor(1 / quotedUsd))}`]
+        : []),
+      '',
+      'send USDC, or:',
+      ...(token ? [`TOKEN ${groupCa(token.mint)}`] : []),
+      ...(leos ? [`LEOS ${groupCa(leos.mint)}`] : []),
+      '',
+      'then /topup — or /wallet to see this again',
+    ].join('\n');
+  }
 }
 
 // ---------------------------------------------------------------- models
@@ -224,7 +242,6 @@ async function generateText(
   const svc = runtime.getService<OpenzooService>('openzoo');
   const { data, receipt } = await zooChat(body, {
     contextId: svc?.contextId,
-    subscriptionKey: subscriptionKey(runtime),
     signal: params.signal,
     // Streaming: deltas are forwarded to core as they arrive off the SSE
     // wire; the full string still returns at the end (always a legal
@@ -276,16 +293,14 @@ export const openzooPlugin: Plugin = {
     OPENZOO_API_BASE: env.OPENZOO_API_BASE ?? null,
     OPENZOO_SMALL_MODEL: env.OPENZOO_SMALL_MODEL ?? null,
     OPENZOO_LARGE_MODEL: env.OPENZOO_LARGE_MODEL ?? null,
-    OPENZOO_SUBSCRIPTION_KEY: env.OPENZOO_SUBSCRIPTION_KEY ?? null,
     OPENZOO_KNOWLEDGE: env.OPENZOO_KNOWLEDGE ?? null,
     OPENZOO_KNOWLEDGE_ROOTS: env.OPENZOO_KNOWLEDGE_ROOTS ?? null,
     OPENZOO_ELIZA_GROUP_WALLETS: env.OPENZOO_ELIZA_GROUP_WALLETS ?? null,
-    OPENZOO_ELIZA_GROUP_STRICT: env.OPENZOO_ELIZA_GROUP_STRICT ?? null,
   },
   async init(_config, runtime) {
     logger.info(
       { src: 'plugin:openzoo' },
-      `gateway ${zooConfig.apiBase} · payer ${subscriptionKey(runtime) ? 'subscription' : 'x402 wallet'} · models ${getSetting(runtime, 'OPENZOO_SMALL_MODEL', DEFAULT_SMALL)}/${getSetting(runtime, 'OPENZOO_LARGE_MODEL', DEFAULT_LARGE)}`,
+      `gateway ${zooConfig.apiBase} · x402 only, one burner per chat · models ${getSetting(runtime, 'OPENZOO_SMALL_MODEL', DEFAULT_SMALL)}/${getSetting(runtime, 'OPENZOO_LARGE_MODEL', DEFAULT_LARGE)}`,
     );
   },
   services: [OpenzooService],

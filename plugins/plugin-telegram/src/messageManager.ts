@@ -1723,6 +1723,7 @@ export class MessageManager {
           fn: () => Promise<T>,
         ) => Promise<T>;
         drainReceipt?: (roomId: string) => string;
+        paywallMessage?: (chatId: string, quotedUsd?: number) => string;
       };
       let zoo: ZooHooks | null = null;
       try {
@@ -1930,13 +1931,41 @@ export class MessageManager {
             memory,
             callback,
           );
-        if (typeof zoo?.runWithScope === "function") {
-          await zoo.runWithScope(
-            { roomId: roomId as string, chatId: `tg:${telegramChatId}` },
-            runHandle,
+        try {
+          if (typeof zoo?.runWithScope === "function") {
+            await zoo.runWithScope(
+              { roomId: roomId as string, chatId: `tg:${telegramChatId}` },
+              runHandle,
+            );
+          } else {
+            await runHandle();
+          }
+        } catch (payErr) {
+          // openzoo fork: a broke chat wallet is the EXPECTED path — it is
+          // how a chat learns where to send money. Echo the funding message
+          // (the chat's own burner address + what to send) into the chat
+          // instead of letting the 402 die in the logs as a silent failure.
+          const errName = (payErr as Error)?.name ?? "";
+          const errMsg = String((payErr as Error)?.message ?? payErr ?? "");
+          const broke =
+            errName === "GroupUnderfundedError" ||
+            /underfund|insufficient|\b402\b/i.test(errMsg);
+          if (!broke || typeof zoo?.paywallMessage !== "function") {
+            throw payErr;
+          }
+          const quotedUsd = Number(
+            (payErr as { quotedUsd?: number })?.quotedUsd ?? 0,
           );
-        } else {
-          await runHandle();
+          const paywall = zoo.paywallMessage(
+            `tg:${telegramChatId}`,
+            quotedUsd,
+          );
+          await this.sendMessageInChunks(
+            ctx,
+            { text: paywall } as Content,
+            message.message_id,
+            threadIdNum,
+          );
         }
         await this.markTelegramMessageDeliveryState(
           telegramChatId,
