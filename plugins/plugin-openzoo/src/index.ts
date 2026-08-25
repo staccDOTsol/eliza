@@ -157,6 +157,29 @@ export class OpenzooService extends Service {
   }
 
   /**
+   * Can this chat pay for an answer RIGHT NOW? Checked by the connector
+   * BEFORE the response pipeline runs: core's message service swallows a
+   * mid-pipeline GroupUnderfundedError and answers "Something went wrong"
+   * (observed live), so affordability must be decided up front — funds in,
+   * answer out; no funds, paywall. Positive results are cached for 60s so
+   * a funded chat costs one balance read a minute, not one per message.
+   */
+  private fundedUntil = new Map<string, number>();
+
+  async ensureChatFunded(chatId: string): Promise<{ funded: boolean; balance: number }> {
+    if (process.env.OPENZOO_ELIZA_GROUP_WALLETS === '0') return { funded: true, balance: 0 };
+    const now = Date.now();
+    const exp = this.fundedUntil.get(chatId);
+    if (exp && exp > now) return { funded: true, balance: -1 };
+    const burner = deriveGroupBurner(chatId);
+    const { balance, toppedUp } = await ensureGroupCredit(burner);
+    // Any positive credit can pay SOME calls; only genuinely-zero is broke.
+    const funded = balance > 0.0005 || toppedUp > 0;
+    if (funded) this.fundedUntil.set(chatId, now + 60_000);
+    return { funded, balance };
+  }
+
+  /**
    * The funding message a broke chat sees — xbot's paywall reply,
    * translated to Telegram. Carries the chat's OWN burner address (grouped
    * so lookalikes are checkable), what to send, and the quoted price when

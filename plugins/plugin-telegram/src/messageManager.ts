@@ -1724,6 +1724,9 @@ export class MessageManager {
         ) => Promise<T>;
         drainReceipt?: (roomId: string) => string;
         paywallMessage?: (chatId: string, quotedUsd?: number) => string;
+        ensureChatFunded?: (
+          chatId: string,
+        ) => Promise<{ funded: boolean; balance: number }>;
       };
       let zoo: ZooHooks | null = null;
       try {
@@ -1920,6 +1923,34 @@ export class MessageManager {
         // references, which core's deferred enrichment cannot fetch — resolve
         // bytes and enrich here, at the same point of the turn core's
         // processAttachments would have fetched the old token-bearing URLs.
+        // openzoo fork: affordability is decided BEFORE the pipeline runs.
+        // Core's message service swallows a mid-pipeline payment error and
+        // answers "Something went wrong" (observed live), so a broke chat
+        // must be caught here: paywall echo out, message still ingested,
+        // nothing wasted on a pipeline whose final call cannot settle.
+        if (
+          typeof zoo?.ensureChatFunded === "function" &&
+          typeof zoo?.paywallMessage === "function"
+        ) {
+          const funding = await zoo
+            .ensureChatFunded(`tg:${telegramChatId}`)
+            .catch(() => ({ funded: true, balance: -1 }));
+          if (!funding.funded) {
+            await this.sendMessageInChunks(
+              ctx,
+              { text: zoo.paywallMessage(`tg:${telegramChatId}`) } as Content,
+              message.message_id,
+              threadIdNum,
+            );
+            await this.runtime.createMemory(memory, "messages");
+            await this.markTelegramMessageDeliveryState(
+              telegramChatId,
+              telegramMessageId,
+              "processed",
+            );
+            return;
+          }
+        }
         await this.enrichFileRefAttachments(cleanedAttachments);
         // openzoo fork: wrap the whole response pipeline in the room's pay
         // scope, so every model call fired while answering THIS message
