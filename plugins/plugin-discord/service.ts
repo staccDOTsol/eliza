@@ -702,6 +702,13 @@ export class DiscordService extends Service implements IDiscordService {
 	private readonly voiceTargets = new DiscordVoiceTargetRegistry();
 	private readonly audioSinks = new Map<string, IDiscordAudioSink>();
 	/**
+	 * Serializes one template reconciliation per account/guild/template within
+	 * this DiscordService instance. A service instance owns the Discord clients
+	 * for its configured accounts, so this covers concurrent deliveries through
+	 * those facades; it is intentionally not a cross-process distributed lock.
+	 */
+	private guildTemplateReconcileLocks = new Map<string, Promise<void>>();
+	/**
 	 * In-flight message turns and their status-reaction controllers, so
 	 * `stop()` can drain outstanding work (bounded) and reconcile any
 	 * reaction left showing "in progress" instead of tearing down mid-turn.
@@ -3641,6 +3648,77 @@ export class DiscordService extends Service implements IDiscordService {
 		return resolveDiscordManageServerDestination(runtime, params, accountId);
 	}
 
+	private async revalidateLiveGuildManagementAuthorization(
+		runtime: IAgentRuntime,
+		authorization: MessageConnectorManageServerAuthorization,
+		accountId: string,
+		guild: Guild,
+	): Promise<void> {
+		await revalidateDiscordManageServerAuthorization(
+			runtime,
+			authorization,
+			accountId,
+			guild.id,
+		);
+
+		let members: Collection<string, GuildMember>;
+		try {
+			members = await guild.members.fetch();
+		} catch (error) {
+			// error-policy:J2 live provider membership is required for authorization.
+			throw new ElizaError(
+				"Discord could not verify live guild membership for server management.",
+				{
+					code: "DISCORD_MANAGE_SERVER_MEMBERSHIP_LOOKUP_FAILED",
+					context: { accountId, guildId: guild.id },
+					cause: error,
+				},
+			);
+		}
+		const isLiveMember = [...members.values()].some(
+			(member) =>
+				this.resolveDiscordEntityId(member.id) ===
+				authorization.authorizedEntityId,
+		);
+		if (!isLiveMember) {
+			throw new ElizaError(
+				"Discord server management requires the authorized entity to remain a live guild member.",
+				{
+					code: "DISCORD_MANAGE_SERVER_LIVE_MEMBERSHIP_REQUIRED",
+					context: {
+						accountId,
+						guildId: guild.id,
+						authorizedEntityId: authorization.authorizedEntityId,
+					},
+				},
+			);
+		}
+	}
+
+	private async withGuildTemplateReconcileLock<T>(
+		key: string,
+		run: () => Promise<T>,
+	): Promise<T> {
+		// Some focused tests construct the service from its prototype, so retain
+		// the production field initializer while also making that harness safe.
+		this.guildTemplateReconcileLocks ??= new Map<string, Promise<void>>();
+		const previous = this.guildTemplateReconcileLocks.get(key);
+		let release!: () => void;
+		const current = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		this.guildTemplateReconcileLocks.set(key, current);
+		if (previous) await previous;
+		try {
+			return await run();
+		} finally {
+			release();
+			if (this.guildTemplateReconcileLocks.get(key) === current) {
+				this.guildTemplateReconcileLocks.delete(key);
+			}
+		}
+	}
+
 	/**
 	 * Structural guild management entry point for the message tool
 	 * (`MESSAGE op=manage_server source=discord`). Fail-closed: every write
@@ -3683,11 +3761,11 @@ export class DiscordService extends Service implements IDiscordService {
 			params.authorization.serverId,
 		);
 		const guild = await client.guilds.fetch(params.authorization.serverId);
-		await revalidateDiscordManageServerAuthorization(
+		await this.revalidateLiveGuildManagementAuthorization(
 			runtime,
 			params.authorization,
 			accountId,
-			guild.id,
+			guild,
 		);
 		const gates = this.getGuildManagementGates(accountId);
 		const raw = params.params ?? {};
@@ -3737,25 +3815,42 @@ export class DiscordService extends Service implements IDiscordService {
 				);
 			},
 		};
-		const receipt: GuildManagementReceipt = await executeGuildManagement(
-			{
-				guild: guild as unknown as ManageableGuild,
-				gates,
-				stateStore,
-				templateRegistry: this.getGuildTemplateRegistry(accountId),
-				agentName: this.runtime.character?.name,
-				reasonPrefix: `eliza:${this.runtime.character?.name ?? "agent"} guild management`,
-				beforeMutation: async () => {
-					await revalidateDiscordManageServerAuthorization(
-						runtime,
-						params.authorization,
-						accountId,
-						guild.id,
-					);
+		const executeAuthorized = async (): Promise<GuildManagementReceipt> => {
+			await this.revalidateLiveGuildManagementAuthorization(
+				runtime,
+				params.authorization,
+				accountId,
+				guild,
+			);
+			return executeGuildManagement(
+				{
+					guild: guild as unknown as ManageableGuild,
+					gates,
+					stateStore,
+					templateRegistry: this.getGuildTemplateRegistry(accountId),
+					agentName: this.runtime.character?.name,
+					reasonPrefix: `eliza:${this.runtime.character?.name ?? "agent"} guild management`,
+					beforeMutation: async () => {
+						await this.revalidateLiveGuildManagementAuthorization(
+							runtime,
+							params.authorization,
+							accountId,
+							guild,
+						);
+					},
 				},
-			},
-			request,
-		);
+				request,
+			);
+		};
+		const templateIdentity =
+			request.templateSpec?.id?.trim() || request.template?.trim();
+		const receipt =
+			request.operation === "apply_template" && templateIdentity
+				? await this.withGuildTemplateReconcileLock(
+						JSON.stringify([accountId, guild.id, templateIdentity]),
+						executeAuthorized,
+					)
+				: await executeAuthorized();
 		return {
 			summary: receipt.summary,
 			data: receipt as unknown as Record<string, unknown>,

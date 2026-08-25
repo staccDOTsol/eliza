@@ -26,6 +26,11 @@ const LINKED_ID = "00000000-0000-0000-0000-000000000003" as UUID;
 const ROOM_ID = "00000000-0000-0000-0000-000000000004" as UUID;
 const GUILD_ID = "223456789012345678";
 const ACCOUNT_ID = "primary";
+const LIVE_USER_ID = "423456789012345678";
+
+function liveGuildMembers(present = true) {
+	return new Map(present ? [[LIVE_USER_ID, { id: LIVE_USER_ID }]] : []);
+}
 
 function authorizationHarness() {
 	let member = true;
@@ -101,6 +106,23 @@ async function errorCode(run: () => Promise<unknown>): Promise<string> {
 	} catch (error) {
 		if (!(error instanceof ElizaError)) throw error;
 		return error.code;
+	}
+}
+
+async function bounded<T>(promise: Promise<T>, label: string): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			promise,
+			new Promise<never>((_, reject) => {
+				timer = setTimeout(
+					() => reject(new Error(`Timed out waiting for ${label}.`)),
+					2_000,
+				);
+			}),
+		]);
+	} finally {
+		if (timer) clearTimeout(timer);
 	}
 }
 
@@ -212,6 +234,7 @@ describe("Discord guild-management authorization", () => {
 		const service = Object.assign(Object.create(DiscordService.prototype), {
 			runtime,
 			defaultAccountId: ACCOUNT_ID,
+			resolveDiscordEntityId: () => LINKED_ID,
 			getClient: () => ({
 				isReady: () => true,
 				guilds: {
@@ -268,9 +291,7 @@ describe("Discord guild-management authorization", () => {
 					kick: async () => undefined,
 					timeout: async () => undefined,
 				},
-				fetch: async () => {
-					throw new Error("unexpected member lookup");
-				},
+				fetch: async () => liveGuildMembers(),
 			},
 			roles: {
 				everyone: { id: GUILD_ID },
@@ -308,6 +329,7 @@ describe("Discord guild-management authorization", () => {
 				},
 			},
 			defaultAccountId: ACCOUNT_ID,
+			resolveDiscordEntityId: () => LINKED_ID,
 			getClient: () => ({
 				isReady: () => true,
 				guilds: {
@@ -357,9 +379,7 @@ describe("Discord guild-management authorization", () => {
 					permissions: { has: () => true },
 					roles: { highest: { position: 100 }, cache: empty },
 				},
-				fetch: async () => {
-					throw new Error("unexpected member lookup");
-				},
+				fetch: async () => liveGuildMembers(),
 			},
 			roles: {
 				everyone: { id: GUILD_ID },
@@ -403,6 +423,7 @@ describe("Discord guild-management authorization", () => {
 		const service = Object.assign(Object.create(DiscordService.prototype), {
 			runtime: serviceRuntime,
 			defaultAccountId: ACCOUNT_ID,
+			resolveDiscordEntityId: () => LINKED_ID,
 			getClient: () => ({
 				isReady: () => true,
 				guilds: { fetch: async () => guild },
@@ -430,6 +451,241 @@ describe("Discord guild-management authorization", () => {
 			),
 		).toBe("MANAGE_SERVER_DESTINATION_NOT_AUTHORIZED");
 		expect(mutationCount).toBe(1);
+	});
+
+	it("stops template writes when live membership is revoked but durable membership remains", async () => {
+		const { runtime } = authorizationHarness();
+		const destination = resolveDiscordManageServerDestination(
+			runtime,
+			{ serverId: GUILD_ID },
+			ACCOUNT_ID,
+		);
+		const authorization = await authorizeManageServerDestination(
+			runtime,
+			REQUESTER_ID,
+			destination,
+		);
+		let liveMember = true;
+		let mutationCount = 0;
+		const empty = new Map();
+		const guild = {
+			id: GUILD_ID,
+			name: "Destination B",
+			members: {
+				me: {
+					id: "bot",
+					permissions: { has: () => true },
+					roles: { highest: { position: 100 }, cache: empty },
+				},
+				fetch: async () => liveGuildMembers(liveMember),
+			},
+			roles: {
+				everyone: { id: GUILD_ID },
+				cache: empty,
+				fetch: async () => null,
+				create: async (options: Record<string, unknown>) => {
+					mutationCount += 1;
+					liveMember = false;
+					return {
+						id: `52345678901234567${mutationCount}`,
+						name: String(options.name),
+					};
+				},
+			},
+			channels: {
+				cache: empty,
+				fetch: async () => null,
+				create: async () => {
+					throw new Error("unexpected channel mutation");
+				},
+			},
+			bans: {
+				create: async () => undefined,
+				remove: async () => undefined,
+			},
+		} as unknown as ManageableGuild;
+		const serviceRuntime = Object.assign(Object.create(runtime), {
+			getSetting: () => undefined,
+			getCache: async () => undefined,
+			setCache: async () => undefined,
+			character: {
+				...runtime.character,
+				settings: {
+					...runtime.character.settings,
+					discord: {
+						actions: { channels: true, roles: true, permissions: true },
+					},
+				},
+			},
+		});
+		const service = Object.assign(Object.create(DiscordService.prototype), {
+			runtime: serviceRuntime,
+			defaultAccountId: ACCOUNT_ID,
+			resolveDiscordEntityId: () => LINKED_ID,
+			getClient: () => ({
+				isReady: () => true,
+				guilds: { fetch: async () => guild },
+			}),
+		}) as unknown as DiscordService;
+
+		expect(
+			await errorCode(() =>
+				service.manageConnectorServer(serviceRuntime, {
+					target: destination.target,
+					operation: "apply_template",
+					serverId: GUILD_ID,
+					authorization,
+					params: {
+						templateSpec: {
+							id: "live-revocation-race",
+							roles: [
+								{ key: "first", name: "First" },
+								{ key: "second", name: "Second" },
+							],
+						},
+					},
+					accountId: ACCOUNT_ID,
+				}),
+			),
+		).toBe("DISCORD_MANAGE_SERVER_LIVE_MEMBERSHIP_REQUIRED");
+		expect(mutationCount).toBe(1);
+	});
+
+	it("serializes concurrent template replays into one provider resource set", async () => {
+		const { runtime } = authorizationHarness();
+		const destination = resolveDiscordManageServerDestination(
+			runtime,
+			{ serverId: GUILD_ID },
+			ACCOUNT_ID,
+		);
+		const authorization = await authorizeManageServerDestination(
+			runtime,
+			REQUESTER_ID,
+			destination,
+		);
+		const cache = new Map<string, Record<string, string>>();
+		const roles = new Map<string, Record<string, unknown>>();
+		let mutationCount = 0;
+		let crossBarrier!: () => void;
+		const barrier = new Promise<void>((resolve) => {
+			crossBarrier = resolve;
+		});
+		let releaseMutation!: () => void;
+		const mutationRelease = new Promise<void>((resolve) => {
+			releaseMutation = resolve;
+		});
+		const empty = new Map();
+		const guild = {
+			id: GUILD_ID,
+			name: "Destination B",
+			members: {
+				me: {
+					id: "bot",
+					permissions: { has: () => true },
+					roles: { highest: { position: 100 }, cache: empty },
+				},
+				fetch: async () => liveGuildMembers(),
+			},
+			roles: {
+				everyone: { id: GUILD_ID },
+				cache: roles,
+				fetch: async (id: string) => roles.get(id) ?? null,
+				create: async (options: Record<string, unknown>) => {
+					mutationCount += 1;
+					const role = {
+						id: "623456789012345678",
+						name: String(options.name),
+						managed: false,
+						position: 1,
+						color: 0,
+						hoist: false,
+						mentionable: false,
+						permissions: { toArray: () => [] },
+						edit: async () => undefined,
+					};
+					roles.set(role.id, role);
+					crossBarrier();
+					await mutationRelease;
+					return role;
+				},
+			},
+			channels: {
+				cache: empty,
+				fetch: async () => null,
+				create: async () => {
+					throw new Error("unexpected channel mutation");
+				},
+			},
+			bans: {
+				create: async () => undefined,
+				remove: async () => undefined,
+			},
+		} as unknown as ManageableGuild;
+		const serviceRuntime = Object.assign(Object.create(runtime), {
+			getSetting: () => undefined,
+			getCache: async (key: string) => cache.get(key),
+			setCache: async (key: string, value: Record<string, string>) => {
+				cache.set(key, value);
+			},
+			character: {
+				...runtime.character,
+				settings: {
+					...runtime.character.settings,
+					discord: {
+						actions: { channels: true, roles: true, permissions: true },
+					},
+				},
+			},
+		});
+		const service = Object.assign(Object.create(DiscordService.prototype), {
+			runtime: serviceRuntime,
+			defaultAccountId: ACCOUNT_ID,
+			resolveDiscordEntityId: () => LINKED_ID,
+			getClient: () => ({
+				isReady: () => true,
+				guilds: { fetch: async () => guild },
+			}),
+		}) as unknown as DiscordService;
+		const params = {
+			target: destination.target,
+			operation: "apply_template",
+			serverId: GUILD_ID,
+			authorization,
+			params: {
+				templateSpec: {
+					id: "concurrent-replay",
+					roles: [{ key: "operator", name: "Operator" }],
+				},
+			},
+			accountId: ACCOUNT_ID,
+		};
+
+		const first = service.manageConnectorServer(serviceRuntime, params);
+		let second: ReturnType<typeof service.manageConnectorServer> | undefined;
+		try {
+			await bounded(barrier, "the first provider mutation barrier");
+			second = service.manageConnectorServer(serviceRuntime, params);
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(mutationCount).toBe(1);
+		} finally {
+			releaseMutation();
+		}
+		if (!second) throw new Error("Concurrent replay did not start.");
+		const [firstReceipt, secondReceipt] = await bounded(
+			Promise.all([first, second]),
+			"both serialized template reconciliations",
+		);
+
+		expect(mutationCount).toBe(1);
+		expect(firstReceipt.data?.entries).toEqual(
+			expect.arrayContaining([expect.objectContaining({ action: "created" })]),
+		);
+		expect(secondReceipt.data?.entries).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ action: "unchanged" }),
+			]),
+		);
 	});
 
 	it("rejects source, account, and guild provenance mismatches", async () => {

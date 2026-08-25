@@ -602,6 +602,29 @@ export async function ensureConnectionsForMessages(
 			},
 		};
 
+		// Establish the room through the single-connection path before the bulk
+		// author write. That path owns durable connector-binding union semantics;
+		// the bulk compatibility API only creates missing rooms and therefore
+		// cannot safely establish or extend their authorization provenance.
+		const firstEntity = entities[0];
+		if (!firstEntity) {
+			return;
+		}
+		await service.runtime.ensureConnection({
+			entityId: firstEntity.id,
+			roomId: rooms[0].id,
+			userName: firstEntity.names[0],
+			name: firstEntity.names[1] ?? firstEntity.names[0],
+			worldName: world.name,
+			source: "discord",
+			channelId: rooms[0].channelId,
+			serverId,
+			messageServerId: rooms[0].messageServerId,
+			type: channelType,
+			worldId,
+			metadata: firstEntity.metadata,
+			roomMetadata: { accountId },
+		});
 		await service.runtime.ensureConnections(entities, rooms, "discord", world);
 
 		for (const authorId of uniqueAuthors.keys()) {

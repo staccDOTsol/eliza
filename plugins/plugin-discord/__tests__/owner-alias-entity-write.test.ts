@@ -24,12 +24,14 @@ const WEBHOOK_ID = "990000000000000001";
 const MEMBER_ID = "990000000000000002";
 
 function makeRuntime() {
+	const ensureConnection = vi.fn().mockResolvedValue(undefined);
 	const ensureConnections = vi.fn().mockResolvedValue(undefined);
 	const runtime = {
 		agentId: "00000000-0000-0000-0000-000000000002",
 		character: { name: "Agent" },
 		getSetting: (key: string) =>
 			key === "ELIZA_ADMIN_ENTITY_ID" ? CANONICAL_OWNER : undefined,
+		ensureConnection,
 		ensureConnections,
 		logger: {
 			debug: vi.fn(),
@@ -38,7 +40,7 @@ function makeRuntime() {
 			error: vi.fn(),
 		},
 	};
-	return { runtime, ensureConnections };
+	return { runtime, ensureConnection, ensureConnections };
 }
 
 function makeService(
@@ -86,7 +88,7 @@ function makeMessage(authorId: string, username: string): Message {
 
 describe("owner-aliased backfill entity writes", () => {
 	it("creates the canonical owner entity bare while a normal author keeps full identity", async () => {
-		const { runtime, ensureConnections } = makeRuntime();
+		const { runtime, ensureConnection, ensureConnections } = makeRuntime();
 		const service = makeService(runtime, [WEBHOOK_ID]);
 
 		await ensureConnectionsForMessages(service, [
@@ -95,6 +97,13 @@ describe("owner-aliased backfill entity writes", () => {
 		]);
 
 		expect(ensureConnections).toHaveBeenCalledTimes(1);
+		expect(ensureConnection).toHaveBeenCalledWith(
+			expect.objectContaining({
+				entityId: CANONICAL_OWNER,
+				serverId: "870000000000000001",
+				roomMetadata: { accountId: "discord-account-1" },
+			}),
+		);
 		const entities = ensureConnections.mock.calls[0][0] as Entity[];
 		const canonical = entities.find((e) => e.id === CANONICAL_OWNER);
 		const member = entities.find(
@@ -142,6 +151,7 @@ describe("owner-aliased backfill entity writes", () => {
 			agentId: "00000000-0000-0000-0000-000000000002",
 			character: { name: "Agent" },
 			getSetting: () => undefined,
+			ensureConnection: vi.fn().mockResolvedValue(undefined),
 			ensureConnections,
 			logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 		};
