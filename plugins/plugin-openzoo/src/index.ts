@@ -27,7 +27,7 @@ import {
   logger,
 } from '@elizaos/core';
 import { config as zooConfig, FUNDING_ASSETS } from 'openzoo/lib/config.js';
-import { deriveGroupBurner, groupCa, type GroupBurner } from './burner';
+import { deriveGroupBurner, type GroupBurner } from './burner';
 import { seedKnowledge } from './knowledge';
 import {
   zooChat,
@@ -138,14 +138,18 @@ export class OpenzooService extends Service {
     const creditUsd = await groupCreditBalance(burner);
     const token = FUNDING_ASSETS.find((a) => a.symbol === 'TOKEN');
     const leos = FUNDING_ASSETS.find((a) => a.symbol === 'LEOS');
+    // RAW addresses, no 4-char grouping: that spacing existed to slip X's
+    // crypto-address filter on new accounts. Telegram has no such filter,
+    // and a spaced address just breaks paste for anyone whose wallet does
+    // not strip whitespace.
     return {
       address: burner.address,
-      addressGrouped: groupCa(burner.address),
+      addressGrouped: burner.address,
       creditUsd,
       fundingLines: [
         'send USDC, or:',
-        ...(token ? [`TOKEN ${groupCa(token.mint)}`] : []),
-        ...(leos ? [`LEOS ${groupCa(leos.mint)}`] : []),
+        ...(token ? [`TOKEN ${token.mint}`] : []),
+        ...(leos ? [`LEOS ${leos.mint}`] : []),
         '+ a little SOL for fees (~0.02 is plenty)',
       ],
     };
@@ -192,7 +196,7 @@ export class OpenzooService extends Service {
     const leos = FUNDING_ASSETS.find((a) => a.symbol === 'LEOS');
     return [
       "this chat's wallet is out of funds — it pays x402 per question. send to:",
-      groupCa(burner.address),
+      burner.address,
       '',
       '+ a little SOL for fees (~0.02 is plenty)',
       ...(quotedUsd > 0
@@ -200,8 +204,8 @@ export class OpenzooService extends Service {
         : []),
       '',
       'send USDC, or:',
-      ...(token ? [`TOKEN ${groupCa(token.mint)}`] : []),
-      ...(leos ? [`LEOS ${groupCa(leos.mint)}`] : []),
+      ...(token ? [`TOKEN ${token.mint}`] : []),
+      ...(leos ? [`LEOS ${leos.mint}`] : []),
       '',
       'then /topup — or /wallet to see this again',
     ].join('\n');
