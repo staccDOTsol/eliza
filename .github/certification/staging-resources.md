@@ -9,8 +9,8 @@ This public view contains opaque resource references and redacted certification 
 - Snapshot observed: `2026-08-24T17:28:55Z`
 - Repository commit: `51617538d704126b0d308654ccaaff091e474a67`
 - Staging deployment commit: `de774b875774f478ef5b879dbdae8fd2997a3470`
-- Deployment observed: `2026-08-25T03:25:13.399Z`
-- Current staging deployment commit: `13c3449cbc6bb88728bb87caa8fd928f5916ff38`
+- Deployment observed: `2026-08-25T04:18:03Z`
+- Current staging deployment commit: `089984beb3db5aab32b486b874a90cb320f4a3a0`
 - Evidence alignment: `REVALIDATION_REQUIRED`
 - READY authorization: `NONE`
 - Policy version: `1`
