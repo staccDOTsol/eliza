@@ -171,14 +171,61 @@ export async function ensureGroupCredit(burner: GroupBurner): Promise<{ balance:
 }
 
 /**
+ * Consume an SSE chat-completions stream: hand each text delta to onChunk,
+ * and synthesize the JSON-shaped body the non-streaming path returns —
+ * model/usage/x402 ride the trailing chunks (stream_options include_usage),
+ * which is where the receipt figures come from on a streamed call.
+ */
+async function consumeSse(
+  res: Response,
+  onChunk?: (delta: string) => void,
+): Promise<any> {
+  const reader = res.body?.getReader();
+  if (!reader) throw new Error('stream had no body');
+  const decoder = new TextDecoder();
+  let buf = '';
+  let text = '';
+  let meta: any = {};
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split('\n');
+    buf = lines.pop() ?? '';
+    for (const line of lines) {
+      const payload = line.match(/^data:\s*(.*)$/)?.[1];
+      if (!payload || payload === '[DONE]') continue;
+      let j: any;
+      try { j = JSON.parse(payload); } catch { continue; }
+      const delta = j?.choices?.[0]?.delta?.content ?? '';
+      if (delta) { text += delta; onChunk?.(delta); }
+      if (j?.model) meta.model = j.model;
+      if (j?.usage) meta.usage = j.usage;
+      if (j?.x402) meta.x402 = j.x402;
+    }
+  }
+  return { ...meta, choices: [{ message: { content: text } }] };
+}
+
+/**
  * One chat completion, paid by whoever is in scope. Returns the raw
  * OpenAI-shaped body plus the receipt (which the ledger turns into the
- * price line every reply must carry).
+ * price line every reply must carry). Pass onStreamChunk to stream: deltas
+ * are forwarded as they arrive and the same shape is returned at the end.
  */
 export async function zooChat(
   body: Record<string, unknown>,
-  { contextId, subscriptionKey, signal }: { contextId?: string | null; subscriptionKey?: string; signal?: AbortSignal } = {},
+  { contextId, subscriptionKey, signal, onStreamChunk }: {
+    contextId?: string | null;
+    subscriptionKey?: string;
+    signal?: AbortSignal;
+    onStreamChunk?: (delta: string) => void;
+  } = {},
 ): Promise<{ data: any; receipt: ZooReceipt; payer: 'group-credit' | 'operator' }> {
+  const streaming = typeof onStreamChunk === 'function';
+  if (streaming) {
+    body = { ...body, stream: true, stream_options: { include_usage: true } };
+  }
   const scope = currentZooScope();
   const url = `${GATEWAY}/v1/chat/completions`;
   const base: Record<string, string> = {
@@ -204,7 +251,7 @@ export async function zooChat(
       if (toppedUp > 0) res = await attempt();
     }
     if (res.ok) {
-      const data = await res.json();
+      const data = streaming ? await consumeSse(res, onStreamChunk) : await res.json();
       return { data, receipt: receiptFrom(data), payer: 'group-credit' };
     }
     if (res.status !== 402) {
@@ -228,13 +275,40 @@ export async function zooChat(
       body: JSON.stringify(body),
       ...(signal ? { signal } : {}),
     });
-    const data: any = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(`gateway ${res.status}: ${JSON.stringify(data).slice(0, 200)}`);
+    if (!res.ok) {
+      const err: any = await res.json().catch(() => ({}));
+      throw new Error(`gateway ${res.status}: ${JSON.stringify(err).slice(0, 200)}`);
+    }
+    const data: any = streaming ? await consumeSse(res, onStreamChunk) : await res.json();
     return { data, receipt: receiptFrom(data), payer: 'operator' };
   }
 
   const { PayClient } = await import('openzoo/lib/pay.js');
   const pay = new PayClient();
+  if (streaming) {
+    // chat() parses JSON, so the streamed lane goes through fetch(), which
+    // does the same 402 → pay → replay dance and hands back the live
+    // response with its body still open.
+    const paid = await pay.fetch(url, {
+      method: 'POST',
+      headers: base,
+      body: JSON.stringify(body),
+    });
+    const { response } = paid;
+    if (!response.ok) {
+      throw new Error(`gateway ${response.status}: ${(await response.text()).slice(0, 200)}`);
+    }
+    const data = await consumeSse(response, onStreamChunk);
+    const receipt = receiptFrom(data);
+    // A streamed body's trailing chunks carry usage but often not the x402
+    // block — the settle header PayClient decoded has the real figures.
+    // MEASURED without this: "mimo-v2.5 · $0.000217 · openzoo.fun", no
+    // OpenRouter comparison — the one line this whole plugin exists to print.
+    const settled: any = (paid as any).receipt || {};
+    if (!(receipt.billedUsd > 0) && Number(settled.billedUsd) > 0) receipt.billedUsd = Number(settled.billedUsd);
+    if (!(receipt.directUsd > 0) && Number(settled.directUsd) > 0) receipt.directUsd = Number(settled.directUsd);
+    return { data, receipt, payer: 'operator' };
+  }
   const { data } = await pay.chat(body, { headers: base });
   return { data, receipt: receiptFrom(data), payer: 'operator' };
 }

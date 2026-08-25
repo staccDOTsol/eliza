@@ -83,7 +83,11 @@ little SOL and the agent is self-sustaining.
 | `OPENZOO_ELIZA_MASTER` | `~/.openzoo/eliza-master.key` | burner master key path |
 | `OPENZOO_TG_STRICT_DM` | off | `1` = even DMs need an @-tag |
 
-No `TEXT_EMBEDDING` is registered (the gateway is OpenRouter-backed, which
-has no embeddings endpoint) — core degrades gracefully; add
-`@elizaos/plugin-embeddings` pointed at any OpenAI-compatible
-`/embeddings` if you want vector recall on top of leCore.
+Streaming is supported: when core passes `stream` + `onStreamChunk`,
+deltas are forwarded off the SSE wire as they arrive, and the receipt is
+recovered from the x402 settle header (a streamed body's trailing chunks
+carry usage but not the price comparison).
+
+No `TEXT_EMBEDDING` is registered, deliberately — the gateway is
+OpenRouter-backed, which has no embeddings endpoint, and leCore recall
+covers the memory story. Core degrades gracefully without it.

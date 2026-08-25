@@ -57,12 +57,21 @@ function saveState(state: KnowledgeState): void {
   fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 });
 }
 
-/** $HOME/open* plus $HOME/lecore — every root that exists right now. */
+/** Bare files under $HOME matching open* are sauce too (handoff notes and
+ *  the like) — but only text-shaped ones; a banner jpg is not a corpus. */
+const FILE_ROOT_EXTS = new Set(['.md', '.txt', '.json', '.log']);
+
+/** $HOME/open* (directories AND text files) plus $HOME/lecore — every root
+ *  that exists right now. */
 export function defaultRoots(home: string = os.homedir()): string[] {
   const roots: string[] = [];
   try {
     for (const entry of fs.readdirSync(home, { withFileTypes: true })) {
-      if (entry.isDirectory() && entry.name.startsWith('open')) roots.push(path.join(home, entry.name));
+      if (!entry.name.startsWith('open')) continue;
+      if (entry.isDirectory()) roots.push(path.join(home, entry.name));
+      else if (FILE_ROOT_EXTS.has(path.extname(entry.name).toLowerCase())) {
+        roots.push(path.join(home, entry.name));
+      }
     }
   } catch { /* unreadable home — nothing to crawl */ }
   const lecore = path.join(home, 'lecore');
@@ -108,9 +117,15 @@ export async function seedKnowledge(log: (msg: string) => void = () => {}): Prom
     // Gather what changed since the last run, newest state wins.
     const fresh: { file: string; text: string; hash: string }[] = [];
     let runBytes = 0;
+    let capped = false;
     for (const root of roots) {
+      if (capped) break;
       let files: string[] = [];
-      try { files = collectFiles(root); } catch { continue; }
+      // maxFiles raised well past bindpath's default 5000: a capped listing
+      // returns the SAME first N files every run, so anything past the cap
+      // would never be seen at all. The per-run byte cap below is what
+      // actually bounds the work — leftovers bind on later runs.
+      try { files = collectFiles(root, { maxFiles: 100_000 }); } catch { continue; }
       for (const f of files) {
         try {
           if (fs.statSync(f).size > MAX_FILE_BYTES) continue;
@@ -118,7 +133,8 @@ export async function seedKnowledge(log: (msg: string) => void = () => {}): Prom
           const h = sha(text);
           if (state.bound[f] === h) continue;
           if (runBytes + text.length > MAX_RUN_BYTES) {
-            log(`knowledge: hit ${Math.round(MAX_RUN_BYTES / 1048576)}MB run cap — remaining files bind next start`);
+            log(`knowledge: hit ${Math.round(MAX_RUN_BYTES / 1048576)}MB run cap — remaining files bind on the next pass`);
+            capped = true;
             break;
           }
           runBytes += text.length;

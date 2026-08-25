@@ -87,19 +87,36 @@ export class OpenzooService extends Service {
   ledger = new ReceiptLedger();
   contextId: string | null = null;
 
+  private rescanTimer: ReturnType<typeof setInterval> | null = null;
+
   static async start(runtime: IAgentRuntime): Promise<OpenzooService> {
     const svc = new OpenzooService(runtime);
     // Knowledge seeding is an enhancement, never a precondition: the agent
     // must come up (and answer) while megabytes of sauce bind in the
     // background. The context id lands on calls as soon as it exists.
-    void seedKnowledge((m) => logger.info({ src: 'plugin:openzoo' }, m)).then((ctx) => {
-      svc.contextId = ctx;
-      if (ctx) logger.info({ src: 'plugin:openzoo' }, `knowledge context attached: ${ctx}`);
-    });
+    const seed = () =>
+      seedKnowledge((m) => logger.info({ src: 'plugin:openzoo' }, m)).then((ctx) => {
+        if (ctx && ctx !== svc.contextId) {
+          svc.contextId = ctx;
+          logger.info({ src: 'plugin:openzoo' }, `knowledge context attached: ${ctx}`);
+        }
+      });
+    void seed();
+    // Rescan on an interval so a long-running bot keeps ingesting new
+    // sauce, not just what existed at boot. Also how a crawl that hit the
+    // per-run byte cap works through its backlog. 0 disables.
+    const rescanMs = Number(process.env.OPENZOO_KNOWLEDGE_RESCAN_MS ?? 3_600_000);
+    if (rescanMs > 0) {
+      svc.rescanTimer = setInterval(() => void seed(), rescanMs);
+      svc.rescanTimer.unref?.();
+    }
     return svc;
   }
 
-  async stop(): Promise<void> { /* nothing held open */ }
+  async stop(): Promise<void> {
+    if (this.rescanTimer) clearInterval(this.rescanTimer);
+    this.rescanTimer = null;
+  }
 
   /**
    * Wrap a response pipeline so every model call inside it settles against
@@ -209,6 +226,12 @@ async function generateText(
     contextId: svc?.contextId,
     subscriptionKey: subscriptionKey(runtime),
     signal: params.signal,
+    // Streaming: deltas are forwarded to core as they arrive off the SSE
+    // wire; the full string still returns at the end (always a legal
+    // handler result), with usage/x402 read from the trailing chunks.
+    ...(params.stream && typeof params.onStreamChunk === 'function'
+      ? { onStreamChunk: params.onStreamChunk as (d: string) => void }
+      : {}),
   });
 
   const text: string = data?.choices?.[0]?.message?.content ?? '';
