@@ -1593,6 +1593,7 @@ export class VoiceManager extends EventEmitter {
 				metadata: {
 					accountId: this.accountId,
 				},
+				roomMetadata: { accountId: this.accountId },
 			});
 
 			const memory: Memory = {

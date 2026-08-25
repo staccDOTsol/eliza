@@ -167,6 +167,7 @@ export async function handleReaction(
 				),
 				accountId,
 			},
+			roomMetadata: { accountId },
 		});
 
 		const inReplyTo = createUniqueUuid(service.runtime, reaction.message.id);

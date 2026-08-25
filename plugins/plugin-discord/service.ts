@@ -2112,6 +2112,7 @@ export class DiscordService extends Service implements IDiscordService {
 								metadata: {
 									accountId,
 								},
+								roomMetadata: { accountId },
 							});
 						}
 						const dedupeParams = {
@@ -2276,6 +2277,7 @@ export class DiscordService extends Service implements IDiscordService {
 							metadata: {
 								accountId,
 							},
+							roomMetadata: { accountId },
 						});
 					} catch (error) {
 						// error-policy:J1 local persistence boundary keeps provider

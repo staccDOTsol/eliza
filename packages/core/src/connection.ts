@@ -32,6 +32,8 @@ export interface EnsureConnectionParams {
 	messageServerId?: UUID;
 	userId?: UUID;
 	metadata?: Record<string, JsonValue>;
+	/** Room-scoped connector metadata such as the selected account id. */
+	roomMetadata?: Record<string, JsonValue>;
 }
 
 export interface EnsureConnectionsParams {
@@ -283,6 +285,7 @@ export async function ensureConnections(
 			serverId: c.serverId,
 			messageServerId: c.messageServerId,
 			worldId,
+			metadata: c.roomMetadata,
 		};
 		roomMap.set(c.roomId, room);
 
