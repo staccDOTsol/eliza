@@ -364,7 +364,9 @@ describe("TelegramService startup wiring", () => {
     expect(api.getMeCalls()).toBe(5);
     expect(startRegistration).toHaveBeenCalledTimes(1);
     expect(commandRegistration).toHaveBeenCalledTimes(
-      buildTelegramCommandDescriptors(runtime.agentId).length + 3,
+      // openzoo fork: +3 for the /wallet, /balance, /topup group-wallet
+      // commands registered by registerOpenzooCommands.
+      buildTelegramCommandDescriptors(runtime.agentId).length + 3 + 3,
     );
     expect(middlewareRegistration).toHaveBeenCalledTimes(
       commandRegistration.mock.calls.length +

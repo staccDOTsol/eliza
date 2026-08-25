@@ -1555,6 +1555,66 @@ export class MessageManager {
       const chat = message.chat as Chat;
       const channelType = getChannelType(chat);
 
+      // ---- openzoo fork: addressing signals -----------------------------
+      // The bot INGESTS everything it can see, but only ANSWERS when it is
+      // addressed: an @-tag of its own handle, a reply to one of its own
+      // messages, or a slash command (which arrives as forceReply). DMs
+      // count as addressed — a direct message has exactly one addressee —
+      // unless OPENZOO_TG_STRICT_DM=1.
+      const botInfo =
+        (ctx as { botInfo?: { id?: number; username?: string } }).botInfo ??
+        (
+          this.bot as unknown as
+            | { botInfo?: { id?: number; username?: string } }
+            | undefined
+        )?.botInfo;
+      const rawText =
+        ("text" in message && typeof message.text === "string"
+          ? message.text
+          : "") ||
+        ("caption" in message &&
+        typeof (message as { caption?: string }).caption === "string"
+          ? ((message as { caption?: string }).caption as string)
+          : "");
+      type TgEntity = {
+        type: string;
+        offset: number;
+        length: number;
+        user?: { id?: number };
+      };
+      const msgEntities: TgEntity[] =
+        ("entities" in message && Array.isArray(message.entities)
+          ? (message.entities as TgEntity[])
+          : undefined) ??
+        ("caption_entities" in message &&
+        Array.isArray(
+          (message as { caption_entities?: TgEntity[] }).caption_entities,
+        )
+          ? ((message as { caption_entities?: TgEntity[] })
+              .caption_entities as TgEntity[])
+          : []);
+      const botUsername =
+        typeof botInfo?.username === "string"
+          ? botInfo.username.toLowerCase()
+          : "";
+      const isBotMention = msgEntities.some(
+        (e) =>
+          (e.type === "mention" &&
+            botUsername &&
+            rawText
+              .slice(e.offset, e.offset + e.length)
+              .toLowerCase() === `@${botUsername}`) ||
+          (e.type === "text_mention" &&
+            e.user?.id != null &&
+            e.user.id === botInfo?.id),
+      );
+      const isReplyToBot =
+        "reply_to_message" in message &&
+        !!message.reply_to_message &&
+        (message.reply_to_message as { from?: { id?: number } }).from?.id ===
+          botInfo?.id;
+      // -------------------------------------------------------------------
+
       await this.runtime.ensureConnection({
         entityId,
         roomId,
@@ -1589,6 +1649,14 @@ export class MessageManager {
           source: "telegram",
           metadata: { accountId: this.accountId },
           channelType,
+          // Platform-level addressing for core's shouldRespond: a real
+          // @-mention or reply-to-self answers unconditionally, everything
+          // else stays ingest-only (see the gate below).
+          mentionContext: {
+            isMention: isBotMention,
+            isReply: isReplyToBot,
+            isThread: false,
+          },
           inReplyTo:
             "reply_to_message" in message && message.reply_to_message
               ? createUniqueUuid(
@@ -1644,16 +1712,47 @@ export class MessageManager {
           ? Number(threadId)
           : undefined;
 
+      // openzoo fork: the openzoo plugin's service, when loaded, scopes
+      // model calls to this room's shared burner wallet and accumulates a
+      // cost receipt per room. Looked up by name, never imported — the
+      // connector (and every test-mock runtime without getService) runs
+      // unchanged without it.
+      type ZooHooks = {
+        runWithScope?: <T>(
+          scope: { roomId: string; chatId?: string },
+          fn: () => Promise<T>,
+        ) => Promise<T>;
+        drainReceipt?: (roomId: string) => string;
+      };
+      let zoo: ZooHooks | null = null;
+      try {
+        zoo = (this.runtime.getService?.("openzoo") ??
+          null) as unknown as ZooHooks | null;
+      } catch {
+        zoo = null;
+      }
+
       // Create callback for handling responses
       const baseCallback: HandlerCallback = async (
-        content: Content,
+        rawContent: Content,
         _actionName?: string,
       ) => {
         try {
           // If response is from reasoning do not send it.
-          if (!content.text) {
+          if (!rawContent.text) {
             return [];
           }
+
+          // openzoo fork: EVERY reply carries the receipt — routed model,
+          // billed USD, and what the same tokens would have cost direct on
+          // OpenRouter. The tab covers all model calls made for this turn.
+          const receiptLine =
+            typeof zoo?.drainReceipt === "function"
+              ? zoo.drainReceipt(roomId as string)
+              : "";
+          const content: Content = receiptLine
+            ? { ...rawContent, text: `${rawContent.text}\n\n${receiptLine}` }
+            : rawContent;
 
           // Persist the no-replay barrier before touching Telegram. If the
           // process dies after this point, a redelivered update fails visibly
@@ -1753,7 +1852,22 @@ export class MessageManager {
       const telegramAutoReply =
         !lifeOpsPassiveConnectorsEnabled(this.runtime) &&
         (telegramAutoReplyRaw === true || telegramAutoReplyRaw === "true");
-      const shouldReply = options?.forceReply === true || telegramAutoReply;
+      // openzoo fork: addressed-only by default. The bot answers when it is
+      // @-tagged, replied to, slash-commanded (forceReply), or DM'd — and
+      // ingests everything else silently. TELEGRAM_AUTO_REPLY=true remains
+      // the explicit "answer everything" override.
+      const isAddressed =
+        isBotMention ||
+        isReplyToBot ||
+        (String(channelType) === "DM" &&
+          process.env.OPENZOO_TG_STRICT_DM !== "1");
+      // An addressed message without a messageService (passive mode, bare
+      // test runtimes) degrades to ingest-only; forceReply (an explicit
+      // slash command) keeps its loud failure below.
+      const shouldReply =
+        options?.forceReply === true ||
+        ((isAddressed || telegramAutoReply) &&
+          Boolean(this.runtime.messageService));
 
       if (!shouldReply) {
         try {
@@ -1806,11 +1920,24 @@ export class MessageManager {
         // bytes and enrich here, at the same point of the turn core's
         // processAttachments would have fetched the old token-bearing URLs.
         await this.enrichFileRefAttachments(cleanedAttachments);
-        await this.runtime.messageService.handleMessage(
-          this.runtime,
-          memory,
-          callback,
-        );
+        // openzoo fork: wrap the whole response pipeline in the room's pay
+        // scope, so every model call fired while answering THIS message
+        // settles against THIS group's shared burner and lands on its
+        // receipt tab.
+        const runHandle = () =>
+          this.runtime.messageService!.handleMessage(
+            this.runtime,
+            memory,
+            callback,
+          );
+        if (typeof zoo?.runWithScope === "function") {
+          await zoo.runWithScope(
+            { roomId: roomId as string, chatId: `tg:${telegramChatId}` },
+            runHandle,
+          );
+        } else {
+          await runHandle();
+        }
         await this.markTelegramMessageDeliveryState(
           telegramChatId,
           telegramMessageId,

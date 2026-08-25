@@ -963,6 +963,90 @@ export class TelegramService extends Service {
       commandMessageManager,
       accountId,
     );
+
+    // openzoo fork: group-wallet commands. Deterministic (no model call, no
+    // memory), answered from the openzoo service when it is loaded. Each
+    // group chat shares ONE derived burner wallet: fund it and the group's
+    // questions settle x402 from it; empty, the operator wallet pays.
+    this.registerOpenzooCommands(bot);
+  }
+
+  /** /wallet, /balance, /topup — the group's shared x402 wallet surface. */
+  private registerOpenzooCommands(bot: Telegraf<Context>): void {
+    type ZooService = {
+      walletInfo?: (chatId: string) => Promise<{
+        address: string;
+        addressGrouped: string;
+        creditUsd: number;
+        fundingLines: string[];
+      }>;
+      topUp?: (chatId: string) => Promise<{ balance: number; toppedUp: number }>;
+    };
+    const zoo = (): ZooService | null =>
+      this.runtime.getService("openzoo") as unknown as ZooService | null;
+
+    bot.command("wallet", async (ctx) => {
+      const svc = zoo();
+      if (!svc?.walletInfo || !ctx.chat) {
+        await ctx.reply("openzoo plugin is not loaded — no group wallet here.");
+        return;
+      }
+      try {
+        const info = await svc.walletInfo(`tg:${ctx.chat.id}`);
+        await ctx.reply(
+          [
+            "this group's shared x402 wallet (fund it and questions settle from it):",
+            info.addressGrouped,
+            "",
+            ...info.fundingLines,
+            "",
+            `gateway credit: $${info.creditUsd.toFixed(2)}`,
+          ].join("\n"),
+        );
+      } catch (e) {
+        await ctx.reply(
+          `wallet lookup failed: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    });
+
+    bot.command("balance", async (ctx) => {
+      const svc = zoo();
+      if (!svc?.walletInfo || !ctx.chat) {
+        await ctx.reply("openzoo plugin is not loaded — no group wallet here.");
+        return;
+      }
+      try {
+        const info = await svc.walletInfo(`tg:${ctx.chat.id}`);
+        await ctx.reply(
+          `gateway credit for this group: $${info.creditUsd.toFixed(2)}\nwallet: ${info.addressGrouped}`,
+        );
+      } catch (e) {
+        await ctx.reply(
+          `balance lookup failed: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    });
+
+    bot.command("topup", async (ctx) => {
+      const svc = zoo();
+      if (!svc?.topUp || !ctx.chat) {
+        await ctx.reply("openzoo plugin is not loaded — no group wallet here.");
+        return;
+      }
+      try {
+        const r = await svc.topUp(`tg:${ctx.chat.id}`);
+        await ctx.reply(
+          r.toppedUp > 0
+            ? `topped up $${r.toppedUp.toFixed(2)} of gateway credit (balance $${r.balance.toFixed(2)})`
+            : `nothing to top up — send tokens to the group wallet first (/wallet). balance $${r.balance.toFixed(2)}`,
+        );
+      } catch (e) {
+        await ctx.reply(
+          `topup failed: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    });
   }
 
   /**

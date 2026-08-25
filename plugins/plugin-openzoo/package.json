@@ -1,0 +1,132 @@
+{
+  "name": "@elizaos/plugin-openzoo",
+  "version": "2.0.3-beta.7",
+  "type": "module",
+  "main": "dist/node/index.node.js",
+  "module": "dist/node/index.node.js",
+  "types": "dist/node/index.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/staccDOTsol/eliza.git"
+  },
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "types": "./dist/node/index.d.ts",
+      "node": {
+        "types": "./dist/node/index.d.ts",
+        "import": "./dist/node/index.node.js",
+        "default": "./dist/node/index.node.js"
+      },
+      "import": {
+        "types": "./dist/node/index.d.ts",
+        "default": "./dist/node/index.node.js"
+      },
+      "default": {
+        "types": "./dist/node/index.d.ts",
+        "default": "./dist/node/index.node.js"
+      }
+    },
+    "./*": {
+      "types": "./dist/*.d.ts",
+      "import": "./dist/*.js",
+      "default": "./dist/*.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "elizaos": {
+    "plugin": {
+      "capabilities": [
+        "text-large",
+        "text-small"
+      ]
+    }
+  },
+  "sideEffects": false,
+  "dependencies": {
+    "@elizaos/core": "workspace:*",
+    "@solana/web3.js": "1.98.4",
+    "openzoo": "^0.49.18"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.8",
+    "@types/bun": "^1.3.10",
+    "@types/node": "^25.0.3",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.10"
+  },
+  "scripts": {
+    "dev": "bun run build.ts --watch",
+    "clean": "node ../../packages/scripts/rm-path-recursive.mjs dist .turbo .turbo-tsconfig.json tsconfig.tsbuildinfo",
+    "format": "bunx @biomejs/biome format --write .",
+    "format:check": "bunx @biomejs/biome format .",
+    "lint": "bunx @biomejs/biome check --write --unsafe .",
+    "lint:check": "bunx @biomejs/biome check . --no-errors-on-unmatched",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "bunx vitest run --config vitest.config.ts",
+    "test:watch": "bunx vitest --config vitest.config.ts",
+    "build": "bun run build.ts",
+    "build:ts": "bun run build.ts"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "agentConfig": {
+    "pluginType": "elizaos:plugin:1.0.0",
+    "pluginParameters": {
+      "OPENZOO_API_BASE": {
+        "type": "string",
+        "description": "openzoo x402 gateway base URL",
+        "required": false,
+        "default": "https://x402-tokens.fly.dev",
+        "sensitive": false
+      },
+      "OPENZOO_SMALL_MODEL": {
+        "type": "string",
+        "description": "Model for small/fast calls (default openzoo/auto — the gateway picks a cheap model that is good enough)",
+        "required": false,
+        "default": "openzoo/auto",
+        "sensitive": false
+      },
+      "OPENZOO_LARGE_MODEL": {
+        "type": "string",
+        "description": "Model for large calls (default openzoo/auto)",
+        "required": false,
+        "default": "openzoo/auto",
+        "sensitive": false
+      },
+      "OPENZOO_SUBSCRIPTION_KEY": {
+        "type": "string",
+        "description": "Optional subscription key. Without it every call settles x402 from the wallet — which is the point.",
+        "required": false,
+        "sensitive": true
+      },
+      "OPENZOO_KNOWLEDGE": {
+        "type": "string",
+        "description": "Set to 0 to skip crawling $HOME/open* and $HOME/lecore into the leCore knowledge context at startup",
+        "required": false,
+        "sensitive": false
+      },
+      "OPENZOO_ELIZA_GROUP_WALLETS": {
+        "type": "string",
+        "description": "Set to 0 to disable per-group derived burner wallets (operator wallet pays everything)",
+        "required": false,
+        "sensitive": false
+      }
+    }
+  },
+  "eliza": {
+    "platforms": [
+      "node"
+    ],
+    "runtime": "node",
+    "platformDetails": {
+      "node": "Node/Bun only — signs Solana transactions and reads the local filesystem"
+    }
+  },
+  "peerDependencies": {
+    "@elizaos/core": "workspace:*"
+  }
+}

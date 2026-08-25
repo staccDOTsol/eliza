@@ -46,6 +46,8 @@ import type {
   TwitterRetweetReceivedPayload,
 } from "./types";
 import { TwitterEventTypes } from "./types";
+import { TWEET_MAX_LENGTH } from "./constants";
+import { countTwitterWeightedLength } from "./tweet-length";
 import { parseActionResponseFromText, sendTweet } from "./utils";
 import { describeTweetPhotos } from "./utils/image-descriptions";
 import {
@@ -1354,9 +1356,44 @@ ${tweet.text}`;
 
       const tweetToReplyTo = tweetId || tweet.id;
 
+      // openzoo fork: every reply carries the receipt — routed model, billed
+      // USD, and what the same call would have cost direct on OpenRouter.
+      // The answer is trimmed to make room rather than the receipt dropped:
+      // the receipt is the pitch, and sendTweet THROWS past 280 weighted
+      // chars instead of truncating.
+      let finalText = response.text;
+      let zooSvc: { drainReceipt?: (roomId: string) => string } | null = null;
+      try {
+        zooSvc = (this.runtime.getService?.("openzoo") ?? null) as unknown as {
+          drainReceipt?: (roomId: string) => string;
+        } | null;
+      } catch {
+        zooSvc = null;
+      }
+      const receiptLine =
+        typeof zooSvc?.drainReceipt === "function"
+          ? zooSvc.drainReceipt(message.roomId as string)
+          : "";
+      if (receiptLine) {
+        const suffix = `\n\n${receiptLine}`;
+        if (countTwitterWeightedLength(suffix) + 24 <= TWEET_MAX_LENGTH) {
+          let body = response.text;
+          while (
+            body.length > 0 &&
+            countTwitterWeightedLength(`${body}${suffix}`) > TWEET_MAX_LENGTH
+          ) {
+            body = body.slice(0, -12).trimEnd();
+          }
+          finalText =
+            body.length < response.text.length
+              ? `${body.replace(/\s+\S*$/, "").trimEnd()}…${suffix}`
+              : `${body}${suffix}`;
+        }
+      }
+
       if (this.isDryRun) {
         logger.info(
-          `[DRY RUN] Would have replied to ${tweet.username} with: ${response.text}`,
+          `[DRY RUN] Would have replied to ${tweet.username} with: ${finalText}`,
         );
         return [];
       }
@@ -1372,7 +1409,7 @@ ${tweet.text}`;
       try {
         tweetResult = await sendTweet(
           this.client,
-          response.text,
+          finalText,
           [],
           tweetToReplyTo,
         );
@@ -1392,6 +1429,9 @@ ${tweet.text}`;
         roomId: message.roomId,
         content: {
           ...response,
+          // What was actually posted, receipt included — the memory must
+          // match what the public saw.
+          text: finalText,
           source: "twitter",
           inReplyTo: message.id,
         },
@@ -1459,12 +1499,44 @@ ${tweet.text}`;
       });
     }
 
-    // Process message through message service
-    const result = await this.runtime.messageService.handleMessage(
-      this.runtime,
-      message,
-      callback,
-    );
+    // openzoo fork: everything reaching handleTweet already passed the
+    // mention/reply prefilters, so tell core's shouldRespond gate this is a
+    // platform mention. Skipping the LLM classifier saves a paid model call
+    // on every single mention — a call whose only job was to conclude "yes,
+    // they @-tagged you".
+    message.content.mentionContext = {
+      isMention: true,
+      isReply: message.content.mentionContext?.isReply ?? false,
+      isThread: message.content.mentionContext?.isThread ?? false,
+    };
+
+    // Process message through message service.
+    // openzoo fork: wrapped in the asker's pay scope — on X the shared
+    // burner is per AUTHOR (xbot precedent: an X account id is stable, a
+    // handle is not), so every model call made answering this mention
+    // settles against the asker's own derived wallet when it is funded.
+    type ZooScopeHooks = {
+      runWithScope?: <T>(
+        scope: { roomId: string; chatId?: string },
+        fn: () => Promise<T>,
+      ) => Promise<T>;
+    };
+    let zooScopeSvc: ZooScopeHooks | null = null;
+    try {
+      zooScopeSvc = (this.runtime.getService?.("openzoo") ??
+        null) as unknown as ZooScopeHooks | null;
+    } catch {
+      zooScopeSvc = null;
+    }
+    const runHandle = () =>
+      this.runtime.messageService!.handleMessage(this.runtime, message, callback);
+    const result =
+      typeof zooScopeSvc?.runWithScope === "function"
+        ? await zooScopeSvc.runWithScope(
+            { roomId: message.roomId as string, chatId: `x:${twitterUserId}` },
+            runHandle,
+          )
+        : await runHandle();
 
     if (deliveryError) {
       throw deliveryError instanceof Error
