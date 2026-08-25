@@ -50,7 +50,8 @@ group is unfunded.
 ## Run it
 
 ```jsonc
-// ~/.eliza/eliza.json (or ELIZA_CONFIG_PATH)
+// ~/.local/state/eliza/eliza.json (the default state dir; override with
+// ELIZA_CONFIG_PATH or ELIZA_STATE_DIR)
 {
   "plugins": { "allow": ["openzoo"] },
   "connectors": { "telegram": { "enabled": true } }
