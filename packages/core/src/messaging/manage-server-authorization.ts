@@ -21,16 +21,7 @@ import type {
 	MessageConnectorManageServerDestination,
 	UUID,
 } from "../types/index.ts";
-
-function metadataAccountId(metadata: unknown): string | undefined {
-	if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
-		return undefined;
-	}
-	const accountId = (metadata as Record<string, unknown>).accountId;
-	return typeof accountId === "string" && accountId.length > 0
-		? accountId
-		: undefined;
-}
+import { getConnectorRoomBindings } from "./connector-room-binding.ts";
 
 function deny(
 	code: string,
@@ -69,15 +60,26 @@ export async function authorizeManageServerDestination(
 			destination,
 		);
 	}
-	const serverRooms = (await runtime.getRooms(world.id)).filter(
+	const worldRooms = (await runtime.getRooms(world.id)).filter(
 		(room) =>
 			room.worldId === world.id &&
 			room.source === destination.source &&
-			room.serverId === destination.serverId &&
 			room.messageServerId === destination.messageServerId,
 	);
-	const destinationRooms = serverRooms.filter(
-		(room) => metadataAccountId(room.metadata) === destination.accountId,
+	const serverRooms = worldRooms.filter((room) =>
+		getConnectorRoomBindings(room.metadata).some(
+			(binding) =>
+				binding.source === destination.source &&
+				binding.serverId === destination.serverId,
+		),
+	);
+	const destinationRooms = serverRooms.filter((room) =>
+		getConnectorRoomBindings(room.metadata).some(
+			(binding) =>
+				binding.source === destination.source &&
+				binding.serverId === destination.serverId &&
+				binding.accountId === destination.accountId,
+		),
 	);
 	if (destinationRooms.length === 0) {
 		if (serverRooms.length > 0) {

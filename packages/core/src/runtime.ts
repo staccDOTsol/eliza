@@ -1141,6 +1141,9 @@ function normalizeMessageConnector(
 		connector.postToThreadHandler = metadata.postToThreadHandler;
 	if (metadata.manageServerHandler)
 		connector.manageServerHandler = metadata.manageServerHandler;
+	if (metadata.resolveManageServerDestination)
+		connector.resolveManageServerDestination =
+			metadata.resolveManageServerDestination;
 	if (metadata.contentShaping)
 		connector.contentShaping = {
 			...metadata.contentShaping,

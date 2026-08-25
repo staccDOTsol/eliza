@@ -138,7 +138,13 @@ function harness(options?: {
 							serverId: activeServerId,
 							messageServerId: stringToUuid(activeServerId),
 							metadata: {
-								accountId: options?.bindingAccountId ?? ACCOUNT_ID,
+								connectorBindings: [
+									{
+										source: "discord",
+										accountId: options?.bindingAccountId ?? ACCOUNT_ID,
+										serverId: activeServerId,
+									},
+								],
 							},
 						},
 					]

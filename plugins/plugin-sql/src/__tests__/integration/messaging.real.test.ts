@@ -3,7 +3,14 @@
  * server-scoped memory retrieval, against a real isolated PGlite/Postgres
  * adapter.
  */
-import { ChannelType, type Content, type Memory, type UUID } from "@elizaos/core";
+import {
+  ChannelType,
+  type Content,
+  ensureConnection,
+  type Memory,
+  stringToUuid,
+  type UUID,
+} from "@elizaos/core";
 import { v4 as uuidv4 } from "uuid";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { PgDatabaseAdapter } from "../../pg/adapter";
@@ -37,6 +44,49 @@ describe("Messaging Integration Tests", () => {
   });
 
   describe("Message Server Tests", () => {
+    it("round-trips durable connector account/server room bindings", async () => {
+      const roomId = uuidv4() as UUID;
+      const entityId = uuidv4() as UUID;
+      const guildId = "223456789012345678";
+      const worldId = stringToUuid(`discord-world:${guildId}`);
+
+      await adapter.createEntities([
+        {
+          id: testAgentId,
+          agentId: testAgentId,
+          names: ["Discord agent"],
+        },
+        {
+          id: entityId,
+          agentId: testAgentId,
+          names: ["Discord requester"],
+        },
+      ]);
+
+      for (const accountId of ["primary", "secondary"]) {
+        await ensureConnection(adapter, {
+          agentId: testAgentId,
+          entityId,
+          roomId,
+          worldId,
+          source: "discord",
+          type: ChannelType.GROUP,
+          channelId: "323456789012345678",
+          serverId: guildId,
+          messageServerId: stringToUuid(guildId),
+          roomMetadata: { accountId },
+        });
+      }
+
+      const [room] = await adapter.getRoomsByIds([roomId]);
+      expect(room?.metadata?.connectorBindings).toEqual(
+        expect.arrayContaining([
+          { source: "discord", accountId: "primary", serverId: guildId },
+          { source: "discord", accountId: "secondary", serverId: guildId },
+        ])
+      );
+    });
+
     it("should create and retrieve a message channel", async () => {
       const channelData = {
         messageServerId: messageServerId,

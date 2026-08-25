@@ -3745,6 +3745,14 @@ export class DiscordService extends Service implements IDiscordService {
 				templateRegistry: this.getGuildTemplateRegistry(accountId),
 				agentName: this.runtime.character?.name,
 				reasonPrefix: `eliza:${this.runtime.character?.name ?? "agent"} guild management`,
+				beforeMutation: async () => {
+					await revalidateDiscordManageServerAuthorization(
+						runtime,
+						params.authorization,
+						accountId,
+						guild.id,
+					);
+				},
 			},
 			request,
 		);

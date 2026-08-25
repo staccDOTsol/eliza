@@ -57,7 +57,16 @@ function authorizationHarness() {
 							type: "GROUP",
 							serverId: GUILD_ID,
 							messageServerId: stringToUuid(GUILD_ID),
-							metadata: { accountId: ACCOUNT_ID },
+							metadata: {
+								accountId: ACCOUNT_ID,
+								connectorBindings: [
+									{
+										source: "discord",
+										accountId: ACCOUNT_ID,
+										serverId: GUILD_ID,
+									},
+								],
+							},
 						},
 					]
 				: [],
@@ -323,6 +332,104 @@ describe("Discord guild-management authorization", () => {
 			),
 		).toBe("MANAGE_SERVER_DESTINATION_NOT_AUTHORIZED");
 		expect(mutationCount).toBe(0);
+	});
+
+	it("revalidates before every template mutation after authorization is revoked", async () => {
+		const { runtime, revokeRole } = authorizationHarness();
+		const destination = resolveDiscordManageServerDestination(
+			runtime,
+			{ serverId: GUILD_ID },
+			ACCOUNT_ID,
+		);
+		const authorization = await authorizeManageServerDestination(
+			runtime,
+			REQUESTER_ID,
+			destination,
+		);
+		let mutationCount = 0;
+		const empty = new Map();
+		const guild = {
+			id: GUILD_ID,
+			name: "Destination B",
+			members: {
+				me: {
+					id: "bot",
+					permissions: { has: () => true },
+					roles: { highest: { position: 100 }, cache: empty },
+				},
+				fetch: async () => {
+					throw new Error("unexpected member lookup");
+				},
+			},
+			roles: {
+				everyone: { id: GUILD_ID },
+				cache: empty,
+				fetch: async () => null,
+				create: async (options: Record<string, unknown>) => {
+					mutationCount += 1;
+					if (mutationCount === 1) revokeRole();
+					return {
+						id: `32345678901234567${mutationCount}`,
+						name: String(options.name),
+					};
+				},
+			},
+			channels: {
+				cache: empty,
+				fetch: async () => null,
+				create: async () => {
+					throw new Error("unexpected channel mutation");
+				},
+			},
+			bans: {
+				create: async () => undefined,
+				remove: async () => undefined,
+			},
+		} as unknown as ManageableGuild;
+		const serviceRuntime = Object.assign(Object.create(runtime), {
+			getSetting: () => undefined,
+			getCache: async () => undefined,
+			setCache: async () => undefined,
+			character: {
+				...runtime.character,
+				settings: {
+					...runtime.character.settings,
+					discord: {
+						actions: { channels: true, roles: true, permissions: true },
+					},
+				},
+			},
+		});
+		const service = Object.assign(Object.create(DiscordService.prototype), {
+			runtime: serviceRuntime,
+			defaultAccountId: ACCOUNT_ID,
+			getClient: () => ({
+				isReady: () => true,
+				guilds: { fetch: async () => guild },
+			}),
+		}) as unknown as DiscordService;
+
+		expect(
+			await errorCode(() =>
+				service.manageConnectorServer(serviceRuntime, {
+					target: destination.target,
+					operation: "apply_template",
+					serverId: GUILD_ID,
+					authorization,
+					params: {
+						templateSpec: {
+							id: "revocation-race",
+							roles: [
+								{ key: "first", name: "First" },
+								{ key: "second", name: "Second" },
+							],
+						},
+					},
+					accountId: ACCOUNT_ID,
+				}),
+			),
+		).toBe("MANAGE_SERVER_DESTINATION_NOT_AUTHORIZED");
+		expect(mutationCount).toBe(1);
 	});
 
 	it("rejects source, account, and guild provenance mismatches", async () => {

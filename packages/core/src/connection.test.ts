@@ -38,8 +38,51 @@ describe("ensureConnection", () => {
 			source: "discord",
 			serverId,
 			messageServerId,
-			metadata: { accountId: "primary" },
+			metadata: {
+				accountId: "primary",
+				connectorBindings: [
+					{ source: "discord", accountId: "primary", serverId },
+				],
+			},
 		});
+	});
+
+	it("preserves multiple connector accounts bound to one canonical room", async () => {
+		const adapter = new InMemoryDatabaseAdapter();
+		const agentId = stringToUuid("discord-multi-account-agent");
+		const entityId = stringToUuid("discord-multi-account-requester");
+		const roomId = stringToUuid("discord-multi-account-room");
+		const worldId = stringToUuid("discord-multi-account-world");
+		const serverId = "423456789012345678";
+		const base = {
+			agentId,
+			entityId,
+			roomId,
+			worldId,
+			messageServerId: stringToUuid(serverId),
+			serverId,
+			source: "discord",
+			channelId: "523456789012345678",
+		};
+
+		await Promise.all([
+			ensureConnection(adapter, {
+				...base,
+				roomMetadata: { accountId: "primary" },
+			}),
+			ensureConnection(adapter, {
+				...base,
+				roomMetadata: { accountId: "secondary" },
+			}),
+		]);
+
+		const [room] = await adapter.getRoomsByIds([roomId]);
+		expect(room?.metadata?.connectorBindings).toEqual(
+			expect.arrayContaining([
+				{ source: "discord", accountId: "primary", serverId },
+				{ source: "discord", accountId: "secondary", serverId },
+			]),
+		);
 	});
 
 	it("preserves existing role grants when another caller reconciles", async () => {

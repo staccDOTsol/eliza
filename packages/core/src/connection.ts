@@ -9,6 +9,7 @@
  */
 
 import { logger } from "./logger";
+import { mergeConnectorRoomMetadata } from "./messaging/connector-room-binding.ts";
 import type { Entity, JsonValue, Metadata, Room, UUID, World } from "./types";
 import { ChannelType } from "./types";
 import type { IDatabaseAdapter } from "./types/database";
@@ -276,6 +277,11 @@ export async function ensureConnections(
 			(Object.values(ChannelType) as string[]).includes(c.type)
 				? (c.type as keyof typeof ChannelType)
 				: ChannelType.DM;
+		const priorRoom = roomMap.get(c.roomId);
+		const accountId =
+			typeof c.roomMetadata?.accountId === "string"
+				? c.roomMetadata.accountId
+				: undefined;
 		const room: Room = {
 			id: c.roomId,
 			name: c.roomName || c.name || "default",
@@ -285,7 +291,13 @@ export async function ensureConnections(
 			serverId: c.serverId,
 			messageServerId: c.messageServerId,
 			worldId,
-			metadata: c.roomMetadata,
+			metadata: mergeConnectorRoomMetadata(
+				priorRoom?.metadata,
+				c.roomMetadata as Metadata | undefined,
+				c.serverId && accountId
+					? { source, accountId, serverId: c.serverId }
+					: undefined,
+			),
 		};
 		roomMap.set(c.roomId, room);
 
@@ -367,11 +379,31 @@ export async function ensureConnections(
 		},
 	);
 
-	const rooms = [...roomMap.values()].map((r) => ({
-		...r,
-		agentId,
-	}));
-	if (rooms.length) await adapter.upsertRooms(rooms);
+	const roomIds = [...roomMap.keys()] as UUID[];
+	await withRecordLocks(
+		adapter,
+		roomIds.map((id) => `room:${id}`),
+		async () => {
+			const existingRooms =
+				roomIds.length > 0 ? await adapter.getRoomsByIds(roomIds) : [];
+			const existingRoomsById = new Map(
+				(existingRooms ?? []).map((room) => [room.id, room]),
+			);
+			const rooms = [...roomMap.values()].map((room) => {
+				const existing = existingRoomsById.get(room.id);
+				return {
+					...existing,
+					...room,
+					agentId,
+					metadata: mergeConnectorRoomMetadata(
+						existing?.metadata,
+						room.metadata,
+					),
+				};
+			});
+			if (rooms.length) await adapter.upsertRooms(rooms);
+		},
+	);
 
 	let createdRoomParticipants = 0;
 	for (const [roomId, entityIdsSet] of roomParticipants) {

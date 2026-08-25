@@ -78,6 +78,42 @@ describe("message and post connector registries", () => {
 		expect(sendHandler).toHaveBeenCalledWith(runtime, target, content);
 	});
 
+	it("preserves the manage-server resolver through runtime registration", async () => {
+		const runtime = makeRuntime();
+		const destination = {
+			source: "discord",
+			accountId: "primary",
+			serverId: "223456789012345678",
+			messageServerId:
+				"00000000-0000-0000-0000-000000000111" as TargetInfo["roomId"],
+			destinationWorldId:
+				"00000000-0000-0000-0000-000000000112" as TargetInfo["roomId"],
+			target: {
+				source: "discord",
+				accountId: "primary",
+				serverId: "223456789012345678",
+			},
+		};
+		const resolveManageServerDestination = vi.fn(() => destination);
+
+		runtime.registerMessageConnector({
+			source: "discord",
+			accountId: "primary",
+			resolveManageServerDestination,
+			manageServerHandler: async () => ({ summary: "ok" }),
+		});
+
+		const [connector] = runtime.getMessageConnectors();
+		expect(
+			connector?.resolveManageServerDestination?.(runtime, {
+				serverId: destination.serverId,
+			}),
+		).toEqual(destination);
+		expect(resolveManageServerDestination).toHaveBeenCalledWith(runtime, {
+			serverId: destination.serverId,
+		});
+	});
+
 	it("unregisterMessageConnector removes both connector metadata and send handler", async () => {
 		const runtime = makeRuntime();
 		const sendHandler = vi.fn(async () => undefined);
