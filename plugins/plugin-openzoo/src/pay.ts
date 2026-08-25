@@ -1,18 +1,17 @@
 /**
- * How a model call gets paid, in order of preference:
+ * How a model call gets paid — x402 per request, nothing else:
  *
- *   1. GROUP CREDIT — the room's shared burner has prepaid gateway credit
- *      (namespace-keyed to the burner's keypair). Zero chain traffic per
- *      call: the gateway draws the balance down and returns 200.
- *   2. GROUP TOP-UP — the burner holds tokens but no credit: buy as much
- *      credit as the wallet covers in ONE x402 settlement (ported from
- *      xbot's ensureCredit), then retry. $45 of TOKEN becomes thousands of
- *      calls with no further on-chain hops.
- *   3. OPERATOR WALLET — no group burner in scope (DM, CLI, non-telegram
- *      room) or the group is broke: the agent's own machine wallet pays via
- *      openzoo's PayClient (subscription key or per-call x402). This is the
- *      self-sustaining lane — whatever the agent earns on Solana/Base lands
- *      in the same wallet that buys its inference.
+ *   - CHAT IN SCOPE: the chat's derived burner settles each call directly.
+ *     402 quote → sign a token transfer with the chat's keypair, the
+ *     facilitator co-signs as fee payer (two signatures, zero gas for the
+ *     burner) → replay with X-PAYMENT. A broke chat throws
+ *     GroupUnderfundedError, which the connector echoes as a funding
+ *     message. The gateway's credit/top-up endpoints are GONE ("pay per
+ *     request with x402 — no account, no API key, no subscription").
+ *   - NO SCOPE (autonomy loops, control UI, warmups): the agent's own
+ *     machine wallet settles the same way via openzoo's PayClient. This is
+ *     the self-sustaining lane — whatever the agent earns on-chain lands
+ *     in the wallet that buys its next thought.
  *
  * WHY AsyncLocalStorage: eliza model handlers receive (runtime, params) and
  * nothing about the room. The connector (telegram fork) wraps the whole
@@ -24,12 +23,13 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { Connection } from '@solana/web3.js';
 // The shim IS the payment stack — imported, not reimplemented.
-import { config } from 'openzoo/lib/config.js';
+import { config, FUNDING_ASSETS } from 'openzoo/lib/config.js';
 import { withNamespace } from 'openzoo/lib/namespace.js';
 import {
-  parse402,
   orderAccepts,
   buildPaymentOnline,
+  paymentEnvelope,
+  encodeEnvelope,
   paymentHeaders,
   tokenBalance,
   railOf,
@@ -38,10 +38,6 @@ import type { GroupBurner } from './burner';
 import { receiptFrom, type ZooReceipt } from './receipt';
 
 const GATEWAY: string = config.apiBase;
-
-/** Below this credit balance, try to top up before the next call. */
-const CREDIT_MIN_USD = Number(process.env.OPENZOO_ELIZA_CREDIT_MIN || 0.25);
-const TOPUP_CAP_USD = Number(process.env.OPENZOO_ELIZA_TOPUP_CAP || 500);
 
 export interface ZooScope {
   roomId: string;
@@ -80,94 +76,69 @@ function connection(): Connection {
 const ns = (burner: GroupBurner, headers: Record<string, string> = {}) =>
   withNamespace(headers, { keypair: burner.keypair });
 
-/** Credit balance for a group burner's namespace. Errors read as zero. */
-export async function groupCreditBalance(burner: GroupBurner): Promise<number> {
-  try {
-    const r = await fetch(`${GATEWAY}/v1/credits`, { headers: ns(burner) });
-    const j: any = await r.json();
-    return Number(j.balanceUsd ?? j.balance ?? 0);
-  } catch {
-    return 0;
+/**
+ * What the chat's wallet holds on-chain, and whether that can settle a
+ * call. Credit prepay is GONE — the gateway disabled top-ups outright
+ * ("pay per request with x402 — no account, no API key, no subscription"),
+ * so affordability IS the on-chain balance. No SOL required: the payment
+ * envelope's fee payer is the FACILITATOR's gas signer (see the shim's
+ * buildPayment), so the burner signs a transfer and pays zero gas.
+ */
+export async function chatWalletStatus(burner: GroupBurner): Promise<{
+  sol: number;
+  holdings: { symbol: string; ui: number }[];
+  holdingsLine: string;
+  canPay: boolean;
+}> {
+  const conn = connection();
+  const sol = (await conn.getBalance(burner.keypair.publicKey).catch(() => 0)) / 1e9;
+  const holdings: { symbol: string; ui: number }[] = [];
+  for (const a of FUNDING_ASSETS) {
+    const b = await tokenBalance(conn, burner.keypair.publicKey, a.mint).catch(() => null);
+    holdings.push({ symbol: a.symbol, ui: Number(b?.ui ?? 0) });
   }
+  const held = holdings.filter((h) => h.ui > 0);
+  const holdingsLine = held.length
+    ? held.map((h) => `${h.ui} ${h.symbol}`).join(' · ') + (sol > 0 ? ` · ${sol} SOL` : '')
+    : sol > 0 ? `${sol} SOL (no payable tokens)` : 'empty';
+  return { sol, holdings, holdingsLine, canPay: held.length > 0 };
 }
 
 /**
- * Settle ONE x402 payment with the GROUP's keypair. This deliberately does
+ * Settle ONE x402 payment with the CHAT's keypair. This deliberately does
  * not use PayClient: PayClient always signs with the operator's machine
- * wallet, and the entire point of a group burner is that the group's own
- * funds settle the group's own calls. Solana rails only for now — the
+ * wallet, and the entire point of a chat burner is that the chat's own
+ * funds settle the chat's own calls. Solana rails only for now — the
  * derived burner has an EVM key too, but nothing drives it yet.
  */
-async function payWith402(burner: GroupBurner, url: string, init: RequestInit, quote: any): Promise<Response> {
+async function payWith402(
+  burner: GroupBurner,
+  url: string,
+  init: RequestInit,
+  quote: any,
+): Promise<{ res: Response; accept: any }> {
   const candidates = orderAccepts(quote, config.token, {}).filter((a: any) => railOf(a) === 'solana');
   let lastErr: Error | null = null;
   for (const accept of candidates) {
     try {
       const built: any = await buildPaymentOnline(connection(), burner.keypair, accept);
+      // buildPaymentOnline returns the SIGNED TX, not the wire header — the
+      // header is the envelope of (full 402 challenge, accept row, payload).
+      // MEASURED without this: `built.header` is undefined, X-PAYMENT never
+      // sent, and every funded chat re-402'd as "underfunded" forever.
+      const header = encodeEnvelope(paymentEnvelope(quote, accept, built.payload));
       const headers = {
         ...(init.headers as Record<string, string> || {}),
-        ...paymentHeaders(built.header),
+        ...paymentHeaders(header),
       };
       const res = await fetch(url, { ...init, headers: ns(burner, headers) });
-      if (res.status !== 402) return res;
+      if (res.status !== 402) return { res, accept };
       lastErr = new Error(`still 402 after paying ${accept?.extra?.symbol || accept?.asset}`);
     } catch (e: any) {
       lastErr = e;
     }
   }
   throw lastErr || new Error('no payable 402 row');
-}
-
-/**
- * Prepay the gateway the moment the group wallet can afford it — xbot's
- * ensureCredit, re-keyed to the group burner. One settlement buys thousands
- * of calls. Returns { balance, toppedUp }.
- */
-export async function ensureGroupCredit(burner: GroupBurner): Promise<{ balance: number; toppedUp: number }> {
-  const balance = await groupCreditBalance(burner);
-  if (balance >= CREDIT_MIN_USD) return { balance, toppedUp: 0 };
-
-  // What can this wallet afford? Quote $1 of credit and read raw-per-USD
-  // off each solana rail, then divide holdings by it. The gateway prices
-  // TOKEN at spot, so this never needs a price table.
-  let affordable = 0;
-  try {
-    const q = await fetch(`${GATEWAY}/v1/credits/topup`, {
-      method: 'POST',
-      headers: ns(burner, { 'content-type': 'application/json' }),
-      body: JSON.stringify({ usd: 1 }),
-    });
-    if (q.status === 402) {
-      const ch: any = await q.json();
-      for (const row of ch.accepts || []) {
-        if (!String(row.network || '').startsWith('solana')) continue;
-        const perUsd = Number(row.maxAmountRequired || 0);
-        if (!(perUsd > 0)) continue;
-        const bal = await tokenBalance(connection(), burner.keypair.publicKey, row.asset).catch(() => null);
-        if (bal?.raw) affordable = Math.max(affordable, Number(bal.raw) / perUsd);
-      }
-    }
-  } catch { /* fall through — nothing affordable */ }
-  const usdAmt = Math.min(Math.floor(affordable * 0.97 * 100) / 100, TOPUP_CAP_USD);
-  if (usdAmt < 1) return { balance, toppedUp: 0 };   // gateway minimum is $1
-
-  const init: RequestInit = {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ usd: usdAmt }),
-  };
-  const first = await fetch(`${GATEWAY}/v1/credits/topup`, {
-    ...init,
-    headers: ns(burner, init.headers as Record<string, string>),
-  });
-  let res = first;
-  if (first.status === 402) {
-    const quote = await first.json();
-    res = await payWith402(burner, `${GATEWAY}/v1/credits/topup`, init, quote);
-  }
-  const body: any = await res.json().catch(() => ({}));
-  if (!res.ok) return { balance, toppedUp: 0 };
-  return { balance: Number(body.balanceUsd ?? usdAmt), toppedUp: Number(body.creditedUsd ?? usdAmt) };
 }
 
 /**
@@ -220,7 +191,7 @@ export async function zooChat(
     signal?: AbortSignal;
     onStreamChunk?: (delta: string) => void;
   } = {},
-): Promise<{ data: any; receipt: ZooReceipt; payer: 'group-credit' | 'operator' }> {
+): Promise<{ data: any; receipt: ZooReceipt; payer: 'group-x402' | 'operator' }> {
   const streaming = typeof onStreamChunk === 'function';
   if (streaming) {
     body = { ...body, stream: true, stream_options: { include_usage: true } };
@@ -232,36 +203,46 @@ export async function zooChat(
     ...(contextId ? { 'x-hrr-context': contextId } : {}),
   };
 
-  // CHAT LANE — a burner in scope IS the payer, full stop. There is no
-  // subscription and no operator subsidy for chats: every DM, group and
-  // chat is its own burner, funded by its own people. A broke chat gets
-  // GroupUnderfundedError, which the connector echoes into the chat as a
-  // funding message — the xbot paywall, translated to Telegram.
+  // CHAT LANE — a burner in scope IS the payer, full stop. Pay per
+  // request: 402 quote → sign a transfer with the CHAT's keypair
+  // (facilitator co-signs as fee payer — the two-signature dance) →
+  // replay. No credits, no subscription, no operator subsidy. A broke
+  // chat gets GroupUnderfundedError, which the connector echoes into the
+  // chat as a funding message — the xbot paywall, translated to Telegram.
   if (scope?.burner) {
     const burner = scope.burner;
-    const attempt = () => fetch(url, {
+    const init: RequestInit = {
       method: 'POST',
-      headers: ns(burner, { ...base }),
+      headers: { ...base },
       body: JSON.stringify(body),
       ...(signal ? { signal } : {}),
-    });
-    let res = await attempt();
+    };
+    let res = await fetch(url, { ...init, headers: ns(burner, { ...base }) });
+    let paidAccept: any = null;
     if (res.status === 402) {
-      // No credit. Try to buy some from whatever the chat's wallet holds,
-      // then retry ONCE — a second 402 means the chat is genuinely broke.
-      const { toppedUp } = await ensureGroupCredit(burner).catch(() => ({ toppedUp: 0 }));
-      if (toppedUp > 0) res = await attempt();
+      const quote: any = await res.json().catch(() => ({}));
+      try {
+        const paid = await payWith402(burner, url, init, quote);
+        res = paid.res;
+        paidAccept = paid.accept;
+      } catch {
+        const raw = Number(quote?.accepts?.[0]?.maxAmountRequired || 0);
+        throw new GroupUnderfundedError(burner.address, raw > 0 ? raw / 1e6 : 0);
+      }
     }
-    if (res.ok) {
-      const data = streaming ? await consumeSse(res, onStreamChunk) : await res.json();
-      return { data, receipt: receiptFrom(data), payer: 'group-credit' };
-    }
-    if (res.status !== 402) {
+    if (!res.ok) {
+      if (res.status === 402) throw new GroupUnderfundedError(burner.address, 0);
       throw new Error(`gateway ${res.status}: ${(await res.text()).slice(0, 200)}`);
     }
-    const quote: any = await res.json().catch(() => ({}));
-    const raw = Number(quote?.accepts?.[0]?.maxAmountRequired || 0);
-    throw new GroupUnderfundedError(burner.address, raw > 0 ? raw / 1e6 : 0);
+    const data = streaming ? await consumeSse(res, onStreamChunk) : await res.json();
+    const receipt = receiptFrom(data);
+    // Streamed bodies often lack the x402 block — the QUOTE's own figures
+    // are the honest fallback (billed is the reserved ceiling there, so
+    // body figures win whenever present).
+    const extra: any = paidAccept?.extra || {};
+    if (!(receipt.billedUsd > 0) && Number(extra.billedUsd) > 0) receipt.billedUsd = Number(extra.billedUsd);
+    if (!(receipt.directUsd > 0) && Number(extra.directUsd) > 0) receipt.directUsd = Number(extra.directUsd);
+    return { data, receipt, payer: 'group-x402' };
   }
 
   // NO SCOPE — internal calls (autonomy loops, the control UI, boot

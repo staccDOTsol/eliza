@@ -595,12 +595,18 @@ describe("applyTelegramSetMyCommands", () => {
     const payload = setMyCommands.mock.calls[0]?.[0] ?? [];
     expect(Array.isArray(payload)).toBe(true);
     expect(payload.length).toBeGreaterThan(0);
-    expect(payload).toEqual(
-      buildTelegramCommandDescriptors().map((descriptor) => ({
+    // openzoo fork: the wallet commands lead the menu, then the catalog,
+    // capped at Telegram's 100-command limit.
+    const expected = [
+      { command: "wallet", description: expect.any(String) },
+      { command: "balance", description: expect.any(String) },
+      { command: "topup", description: expect.any(String) },
+      ...buildTelegramCommandDescriptors().map((descriptor) => ({
         command: descriptor.name,
         description: descriptor.description,
       })),
-    );
+    ].slice(0, 100);
+    expect(payload).toEqual(expected);
   });
 
   it("swallows setMyCommands network failures without throwing", async () => {

@@ -34,7 +34,13 @@ declare module 'openzoo/lib/x402.js' {
   ): any[];
   export function railOf(accept: unknown): string | null;
   export function paymentHeaders(header: string): Record<string, string>;
-  export function buildPaymentOnline(connection: Connection, keypair: Keypair, accept: unknown): Promise<{ header: string }>;
+  export function paymentEnvelope(body: unknown, accept: unknown, payload: unknown): unknown;
+  export function encodeEnvelope(env: unknown): string;
+  export function buildPaymentOnline(
+    connection: Connection,
+    keypair: Keypair,
+    accept: unknown,
+  ): Promise<{ txBase64: string; payload: { transaction: string }; ownerSignature: string | null }>;
   export function tokenBalance(connection: Connection, owner: PublicKey, mintStr: string): Promise<{ raw: bigint; ui: number | null }>;
   export function decodeSettleHeader(headerValue: string | null): unknown;
 }

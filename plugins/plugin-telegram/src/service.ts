@@ -971,36 +971,41 @@ export class TelegramService extends Service {
     this.registerOpenzooCommands(bot);
   }
 
-  /** /wallet, /balance, /topup — the group's shared x402 wallet surface. */
+  /** /wallet, /balance, /topup — the chat's own x402 wallet surface.
+   *  Pay-per-request: there is no prepaid credit to top up anymore, so
+   *  /balance shows on-chain holdings and /topup just re-checks them. */
   private registerOpenzooCommands(bot: Telegraf<Context>): void {
     type ZooService = {
       walletInfo?: (chatId: string) => Promise<{
         address: string;
         addressGrouped: string;
-        creditUsd: number;
+        holdingsLine: string;
+        canPay: boolean;
         fundingLines: string[];
       }>;
-      topUp?: (chatId: string) => Promise<{ balance: number; toppedUp: number }>;
     };
     const zoo = (): ZooService | null =>
       this.runtime.getService("openzoo") as unknown as ZooService | null;
 
-    bot.command("wallet", async (ctx) => {
+    const walletReply = async (ctx: Context) => {
       const svc = zoo();
       if (!svc?.walletInfo || !ctx.chat) {
-        await ctx.reply("openzoo plugin is not loaded — no group wallet here.");
+        await ctx.reply("openzoo plugin is not loaded — no chat wallet here.");
         return;
       }
       try {
         const info = await svc.walletInfo(`tg:${ctx.chat.id}`);
         await ctx.reply(
           [
-            "this group's shared x402 wallet (fund it and questions settle from it):",
+            "this chat's x402 wallet — every question settles from it, per request:",
             info.addressGrouped,
             "",
             ...info.fundingLines,
             "",
-            `gateway credit: $${info.creditUsd.toFixed(2)}`,
+            `holdings: ${info.holdingsLine}`,
+            info.canPay
+              ? "funded — just ask"
+              : "empty — fund it and ask again (no SOL needed, gas is on us)",
           ].join("\n"),
         );
       } catch (e) {
@@ -1008,45 +1013,11 @@ export class TelegramService extends Service {
           `wallet lookup failed: ${e instanceof Error ? e.message : String(e)}`,
         );
       }
-    });
+    };
 
-    bot.command("balance", async (ctx) => {
-      const svc = zoo();
-      if (!svc?.walletInfo || !ctx.chat) {
-        await ctx.reply("openzoo plugin is not loaded — no group wallet here.");
-        return;
-      }
-      try {
-        const info = await svc.walletInfo(`tg:${ctx.chat.id}`);
-        await ctx.reply(
-          `gateway credit for this group: $${info.creditUsd.toFixed(2)}\nwallet: ${info.addressGrouped}`,
-        );
-      } catch (e) {
-        await ctx.reply(
-          `balance lookup failed: ${e instanceof Error ? e.message : String(e)}`,
-        );
-      }
-    });
-
-    bot.command("topup", async (ctx) => {
-      const svc = zoo();
-      if (!svc?.topUp || !ctx.chat) {
-        await ctx.reply("openzoo plugin is not loaded — no group wallet here.");
-        return;
-      }
-      try {
-        const r = await svc.topUp(`tg:${ctx.chat.id}`);
-        await ctx.reply(
-          r.toppedUp > 0
-            ? `topped up $${r.toppedUp.toFixed(2)} of gateway credit (balance $${r.balance.toFixed(2)})`
-            : `nothing to top up — send tokens to the group wallet first (/wallet). balance $${r.balance.toFixed(2)}`,
-        );
-      } catch (e) {
-        await ctx.reply(
-          `topup failed: ${e instanceof Error ? e.message : String(e)}`,
-        );
-      }
-    });
+    bot.command("wallet", walletReply);
+    bot.command("balance", walletReply);
+    bot.command("topup", walletReply);
   }
 
   /**

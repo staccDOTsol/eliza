@@ -530,10 +530,44 @@ export async function applyTelegramSetMyCommands(
 ): Promise<void> {
   const descriptors = buildTelegramCommandDescriptors(runtime.agentId);
   if (descriptors.length === 0) return;
-  const commands = descriptors.map((descriptor) => ({
-    command: descriptor.name,
-    description: descriptor.description,
-  }));
+  // openzoo fork: the wallet commands lead the menu, and the list is capped
+  // at Telegram's hard limit of 100. Uncapped, setMyCommands 400s with
+  // BOT_COMMANDS_TOO_MUCH and NOTHING publishes — a menu missing its tail
+  // beats no menu at all.
+  const TELEGRAM_COMMAND_MENU_CAP = 100;
+  const openzooCommands = [
+    {
+      command: "wallet",
+      description: "This chat's x402 wallet: address, holdings, how to fund",
+    },
+    {
+      command: "balance",
+      description: "Check this chat's wallet holdings",
+    },
+    {
+      command: "topup",
+      description: "Re-check funds after sending to the chat wallet",
+    },
+  ];
+  const catalog = descriptors
+    .map((descriptor) => ({
+      command: descriptor.name,
+      description: descriptor.description,
+    }))
+    .filter((c) => !openzooCommands.some((o) => o.command === c.command));
+  const commands = [...openzooCommands, ...catalog];
+  if (commands.length > TELEGRAM_COMMAND_MENU_CAP) {
+    logger.warn(
+      {
+        src: "plugin:telegram",
+        accountId,
+        total: commands.length,
+        dropped: commands.length - TELEGRAM_COMMAND_MENU_CAP,
+      },
+      "Slash-command menu exceeds Telegram's 100-command cap; trailing catalog commands omitted from the menu (they still work when typed)",
+    );
+    commands.length = TELEGRAM_COMMAND_MENU_CAP;
+  }
   try {
     await bot.telegram.setMyCommands(commands);
     logger.debug(

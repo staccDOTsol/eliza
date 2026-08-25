@@ -33,15 +33,14 @@ import {
   zooChat,
   runWithZooScope,
   currentZooScope,
-  ensureGroupCredit,
-  groupCreditBalance,
+  chatWalletStatus,
   type ZooScope,
 } from './pay';
 import { ReceiptLedger, priceLine, usd, receiptFrom } from './receipt';
 
 export { priceLine, usd, receiptFrom } from './receipt';
 export { deriveGroupBurner, groupBurnerAddress, groupCa } from './burner';
-export { runWithZooScope, currentZooScope, zooChat, ensureGroupCredit } from './pay';
+export { runWithZooScope, currentZooScope, zooChat, chatWalletStatus } from './pay';
 export { seedKnowledge, bindText, defaultRoots } from './knowledge';
 
 const env = typeof process !== 'undefined' ? process.env : ({} as Record<string, string | undefined>);
@@ -126,38 +125,31 @@ export class OpenzooService extends Service {
     return this.ledger.drain(roomId);
   }
 
-  /** Everything a /wallet reply needs. Addresses grouped for readability —
-   *  and because some platforms refuse raw crypto addresses outright. */
+  /** Everything a /wallet reply needs. RAW addresses, no 4-char grouping:
+   *  that spacing existed to slip X's crypto-address filter, Telegram has
+   *  no such filter, and spaces break paste. */
   async walletInfo(chatId: string): Promise<{
     address: string;
     addressGrouped: string;
-    creditUsd: number;
+    holdingsLine: string;
+    canPay: boolean;
     fundingLines: string[];
   }> {
     const burner = deriveGroupBurner(chatId);
-    const creditUsd = await groupCreditBalance(burner);
+    const status = await chatWalletStatus(burner);
     const token = FUNDING_ASSETS.find((a) => a.symbol === 'TOKEN');
     const leos = FUNDING_ASSETS.find((a) => a.symbol === 'LEOS');
-    // RAW addresses, no 4-char grouping: that spacing existed to slip X's
-    // crypto-address filter on new accounts. Telegram has no such filter,
-    // and a spaced address just breaks paste for anyone whose wallet does
-    // not strip whitespace.
     return {
       address: burner.address,
       addressGrouped: burner.address,
-      creditUsd,
+      holdingsLine: status.holdingsLine,
+      canPay: status.canPay,
       fundingLines: [
         'send USDC, or:',
         ...(token ? [`TOKEN ${token.mint}`] : []),
         ...(leos ? [`LEOS ${leos.mint}`] : []),
-        '+ a little SOL for fees (~0.02 is plenty)',
       ],
     };
-  }
-
-  /** Buy as much gateway credit as the group wallet covers. */
-  async topUp(chatId: string): Promise<{ balance: number; toppedUp: number }> {
-    return ensureGroupCredit(deriveGroupBurner(chatId));
   }
 
   /**
@@ -175,12 +167,12 @@ export class OpenzooService extends Service {
     const now = Date.now();
     const exp = this.fundedUntil.get(chatId);
     if (exp && exp > now) return { funded: true, balance: -1 };
-    const burner = deriveGroupBurner(chatId);
-    const { balance, toppedUp } = await ensureGroupCredit(burner);
-    // Any positive credit can pay SOME calls; only genuinely-zero is broke.
-    const funded = balance > 0.0005 || toppedUp > 0;
-    if (funded) this.fundedUntil.set(chatId, now + 60_000);
-    return { funded, balance };
+    // Affordability IS the on-chain balance now — the gateway killed its
+    // credit system. Any payable token balance settles per-request x402;
+    // no SOL needed (the facilitator pays gas as the co-signing fee payer).
+    const status = await chatWalletStatus(deriveGroupBurner(chatId));
+    if (status.canPay) this.fundedUntil.set(chatId, now + 60_000);
+    return { funded: status.canPay, balance: status.canPay ? 1 : 0 };
   }
 
   /**
@@ -198,16 +190,14 @@ export class OpenzooService extends Service {
       "this chat's wallet is out of funds — it pays x402 per question. send to:",
       burner.address,
       '',
-      '+ a little SOL for fees (~0.02 is plenty)',
       ...(quotedUsd > 0
         ? [`this question quoted up to ${usd(quotedUsd)} — $1 covers roughly ${Math.max(1, Math.floor(1 / quotedUsd))}`]
         : []),
-      '',
       'send USDC, or:',
       ...(token ? [`TOKEN ${token.mint}`] : []),
       ...(leos ? [`LEOS ${leos.mint}`] : []),
       '',
-      'then /topup — or /wallet to see this again',
+      'no SOL needed — payment settles per question, gas is on us. then just ask again, or /wallet to check',
     ].join('\n');
   }
 }
