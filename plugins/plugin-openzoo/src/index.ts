@@ -240,10 +240,19 @@ async function generateText(
       ? getSetting(runtime, 'OPENZOO_SMALL_MODEL', DEFAULT_SMALL)
       : getSetting(runtime, 'OPENZOO_LARGE_MODEL', DEFAULT_LARGE));
 
+  // Answers are BOUNDED, always. A chat message engineered to demand an
+  // 80-decimal research note (observed live, someone tried it within the
+  // hour) otherwise buys minutes of generation — which reads as a timeout
+  // to the chat and burns the chat's wallet on latency. The ceiling holds
+  // even when a caller asks for more.
+  const defaultTokens = Number(getSetting(runtime, 'OPENZOO_MAX_TOKENS', '1024'));
+  const capTokens = Number(getSetting(runtime, 'OPENZOO_MAX_TOKENS_CAP', '4096'));
+  const maxTokens = Math.min(Number(params.maxTokens) > 0 ? Number(params.maxTokens) : defaultTokens, capTokens);
+
   const body: Record<string, unknown> = {
     model,
     messages: toOpenAiMessages(params),
-    ...(params.omitMaxTokens ? {} : { max_tokens: params.maxTokens ?? Number(getSetting(runtime, 'OPENZOO_MAX_TOKENS', '2048')) }),
+    ...(params.omitMaxTokens ? {} : { max_tokens: maxTokens }),
     ...(params.temperature !== undefined ? { temperature: params.temperature } : {}),
     ...(params.topP !== undefined ? { top_p: params.topP } : {}),
     ...(params.frequencyPenalty !== undefined ? { frequency_penalty: params.frequencyPenalty } : {}),

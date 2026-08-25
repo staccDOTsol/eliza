@@ -181,8 +181,14 @@ async function consumeSse(
 /**
  * One chat completion, paid by whoever is in scope. Returns the raw
  * OpenAI-shaped body plus the receipt (which the ledger turns into the
- * price line every reply must carry). Pass onStreamChunk to stream: deltas
- * are forwarded as they arrive and the same shape is returned at the end.
+ * price line every reply must carry). Pass onStreamChunk to receive deltas
+ * as they arrive; the full string is returned at the end either way.
+ *
+ * ALWAYS streamed on the wire, even when the caller wants the whole
+ * string: a non-streaming request to a slow model sits byte-silent for
+ * minutes and the proxy in front of the gateway kills idle connections —
+ * OBSERVED as timeouts on exactly the long generations that cost the
+ * most. SSE deltas keep bytes flowing for the whole generation.
  */
 export async function zooChat(
   body: Record<string, unknown>,
@@ -192,10 +198,7 @@ export async function zooChat(
     onStreamChunk?: (delta: string) => void;
   } = {},
 ): Promise<{ data: any; receipt: ZooReceipt; payer: 'group-x402' | 'operator' }> {
-  const streaming = typeof onStreamChunk === 'function';
-  if (streaming) {
-    body = { ...body, stream: true, stream_options: { include_usage: true } };
-  }
+  body = { ...body, stream: true, stream_options: { include_usage: true } };
   const scope = currentZooScope();
   const url = `${GATEWAY}/v1/chat/completions`;
   const base: Record<string, string> = {
@@ -234,7 +237,7 @@ export async function zooChat(
       if (res.status === 402) throw new GroupUnderfundedError(burner.address, 0);
       throw new Error(`gateway ${res.status}: ${(await res.text()).slice(0, 200)}`);
     }
-    const data = streaming ? await consumeSse(res, onStreamChunk) : await res.json();
+    const data = await consumeSse(res, onStreamChunk);
     const receipt = receiptFrom(data);
     // Streamed bodies often lack the x402 block — the QUOTE's own figures
     // are the honest fallback (billed is the reserved ceiling there, so
@@ -259,32 +262,27 @@ export async function zooChat(
     }
     throw e;
   };
-  if (streaming) {
-    // chat() parses JSON, so the streamed lane goes through fetch(), which
-    // does the same 402 → pay → replay dance and hands back the live
-    // response with its body still open.
-    const paid = await pay.fetch(url, {
-      method: 'POST',
-      headers: base,
-      body: JSON.stringify(body),
-    }).catch(wrapUnderfunded);
-    const { response } = paid;
-    if (!response.ok) {
-      const errText = (await response.text()).slice(0, 300);
-      if (response.status === 402) wrapUnderfunded(new Error(`402 ${errText}`));
-      throw new Error(`gateway ${response.status}: ${errText.slice(0, 200)}`);
-    }
-    const data = await consumeSse(response, onStreamChunk);
-    const receipt = receiptFrom(data);
-    // A streamed body's trailing chunks carry usage but often not the x402
-    // block — the settle header PayClient decoded has the real figures.
-    // MEASURED without this: "mimo-v2.5 · $0.000217 · openzoo.fun", no
-    // OpenRouter comparison — the one line this whole plugin exists to print.
-    const settled: any = (paid as any).receipt || {};
-    if (!(receipt.billedUsd > 0) && Number(settled.billedUsd) > 0) receipt.billedUsd = Number(settled.billedUsd);
-    if (!(receipt.directUsd > 0) && Number(settled.directUsd) > 0) receipt.directUsd = Number(settled.directUsd);
-    return { data, receipt, payer: 'operator' };
+  // pay.fetch does the same 402 → pay → replay dance and hands back the
+  // live response with its body still open for SSE consumption.
+  const paid = await pay.fetch(url, {
+    method: 'POST',
+    headers: base,
+    body: JSON.stringify(body),
+  }).catch(wrapUnderfunded);
+  const { response } = paid;
+  if (!response.ok) {
+    const errText = (await response.text()).slice(0, 300);
+    if (response.status === 402) wrapUnderfunded(new Error(`402 ${errText}`));
+    throw new Error(`gateway ${response.status}: ${errText.slice(0, 200)}`);
   }
-  const { data } = await pay.chat(body, { headers: base }).catch(wrapUnderfunded);
-  return { data, receipt: receiptFrom(data), payer: 'operator' };
+  const data = await consumeSse(response, onStreamChunk);
+  const receipt = receiptFrom(data);
+  // A streamed body's trailing chunks carry usage but often not the x402
+  // block — the settle header PayClient decoded has the real figures.
+  // MEASURED without this: "mimo-v2.5 · $0.000217 · openzoo.fun", no
+  // OpenRouter comparison — the one line this whole plugin exists to print.
+  const settled: any = (paid as any).receipt || {};
+  if (!(receipt.billedUsd > 0) && Number(settled.billedUsd) > 0) receipt.billedUsd = Number(settled.billedUsd);
+  if (!(receipt.directUsd > 0) && Number(settled.directUsd) > 0) receipt.directUsd = Number(settled.directUsd);
+  return { data, receipt, payer: 'operator' };
 }
