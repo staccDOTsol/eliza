@@ -157,5 +157,13 @@ bootstrapMobileEntrypoint().catch((error) => {
     error instanceof Error ? (error.stack ?? error.message) : String(error);
   _binDebugLog(`[bin.ts] FATAL runAutonomousCli threw: ${msg}`);
   console.error("[eliza-autonomous] Failed to start:", msg);
+  // openzoo fork: a wrapped boot error without its cause chain is
+  // undebuggable — "Plugin X failed to initialize" says which, never why.
+  for (let c = (error as Error)?.cause; c; c = (c as Error)?.cause) {
+    console.error(
+      "[eliza-autonomous] caused by:",
+      c instanceof Error ? (c.stack ?? c.message) : String(c),
+    );
+  }
   process.exit(1);
 });
